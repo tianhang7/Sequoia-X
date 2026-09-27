@@ -14,16 +14,16 @@ class MaVolumeStrategy(BaseStrategy):
     选股条件（全部向量化，严禁 iterrows）：
     1. 5日收盘均线上穿20日收盘均线（金叉）
     2. 当日成交量 > 20日均量的 1.5 倍（放量确认）
-
-    Attributes:
-        webhook_key: 路由到 'ma_volume' 专属飞书机器人。
     """
 
-    webhook_key: str = "ma_volume"
+    strategy_key: str = "ma_volume"
 
-    def run(self) -> list[str]:
+    def run(self, as_of: str | None = None) -> list[str]:
         """
         遍历全市场，返回满足均线金叉+放量条件的股票代码列表。
+
+        Args:
+            as_of: 信号日；非 None 时只使用该日期及之前的K线。
 
         Returns:
             满足条件的股票代码列表。
@@ -34,6 +34,8 @@ class MaVolumeStrategy(BaseStrategy):
         for symbol in symbols:
             try:
                 df = self.engine.get_ohlcv(symbol)
+                if as_of is not None:
+                    df = df[df["date"] <= as_of]
                 if len(df) < 20:
                     continue
 

@@ -15,17 +15,17 @@ class UptrendLimitDownStrategy(BaseStrategy):
     1. 处于上升趋势：昨日20日均线 > 昨日60日均线
     2. 放量跌停：今日 close <= 昨日 close * 0.905
                 且今日 volume > 20日均量的 2.0 倍
-
-    Attributes:
-        webhook_key: 路由到 'limit_down' 专属飞书机器人。
     """
 
-    webhook_key: str = "limit_down"
+    strategy_key: str = "limit_down"
     _MIN_BARS: int = 60  # 至少需要 60 根 K 线（60日均线）
 
-    def run(self) -> list[str]:
+    def run(self, as_of: str | None = None) -> list[str]:
         """
         遍历全市场，返回满足上升趋势跌停条件的股票代码列表。
+
+        Args:
+            as_of: 信号日；非 None 时只使用该日期及之前的K线。
 
         Returns:
             满足条件的股票代码列表。
@@ -36,6 +36,8 @@ class UptrendLimitDownStrategy(BaseStrategy):
         for symbol in symbols:
             try:
                 df = self.engine.get_ohlcv(symbol)
+                if as_of is not None:
+                    df = df[df["date"] <= as_of]
                 if len(df) < self._MIN_BARS:
                     continue
 

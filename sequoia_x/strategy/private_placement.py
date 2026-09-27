@@ -14,17 +14,25 @@ class PrivatePlacementStrategy(BaseStrategy):
     """定增公告监控策略。
 
     数据源：akshare stock_qbzf_em()（东方财富-全部增发）
-    逻辑：筛选最近 7 天内发行日期的定向增发公告，推送至飞书。
-
-    Attributes:
-        webhook_key: 路由到 'private_placement' 飞书机器人。
+    逻辑：筛选最近 7 天内发行日期的定向增发公告，推送至 Telegram。
     """
 
-    webhook_key: str = "private_placement"
+    strategy_key: str = "private_placement"
     _LOOKBACK_DAYS: int = 7  # 回看天数，覆盖一周内的新公告
 
-    def run(self) -> list[str]:
-        """拉取定增公告，返回近期有定向增发的股票代码列表。"""
+    def run(self, as_of: str | None = None) -> list[str]:
+        """拉取定增公告，返回近期有定向增发的股票代码列表。
+
+        Args:
+            as_of: 历史模式标记；非 None 时直接返回空列表——本策略基于
+                「今天」的实时公告，无法回放到历史日期，不参与回测。
+        """
+        if as_of is not None:
+            logger.info(
+                f"PrivatePlacementStrategy 为事件型策略（依赖当日公告），"
+                f"跳过历史模式 as_of={as_of}"
+            )
+            return []
         try:
             import akshare as ak
 

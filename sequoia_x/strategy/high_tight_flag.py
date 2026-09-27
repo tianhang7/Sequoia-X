@@ -15,17 +15,17 @@ class HighTightFlagStrategy(BaseStrategy):
     1. 强动量：过去40天区间最高价 / 区间最低价 > 1.6（涨幅超60%）
     2. 极度收敛：最近10天区间最高价 / 区间最低价 < 1.15（振幅低于15%）
     3. 缩量：今日 volume < 过去20日 volume 均值的 0.6 倍
-
-    Attributes:
-        webhook_key: 路由到 'flag' 专属飞书机器人。
     """
 
-    webhook_key: str = "flag"
+    strategy_key: str = "flag"
     _MIN_BARS: int = 40  # 至少需要 40 根 K 线
 
-    def run(self) -> list[str]:
+    def run(self, as_of: str | None = None) -> list[str]:
         """
         遍历全市场，返回满足高旗形整理条件的股票代码列表。
+
+        Args:
+            as_of: 信号日；非 None 时只使用该日期及之前的K线。
 
         Returns:
             满足条件的股票代码列表。
@@ -36,6 +36,8 @@ class HighTightFlagStrategy(BaseStrategy):
         for symbol in symbols:
             try:
                 df = self.engine.get_ohlcv(symbol)
+                if as_of is not None:
+                    df = df[df["date"] <= as_of]
                 if len(df) < self._MIN_BARS:
                     continue
 

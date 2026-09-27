@@ -2,6 +2,7 @@
 
 import sqlite3
 import tempfile
+from contextlib import closing
 from datetime import date
 from pathlib import Path
 
@@ -18,7 +19,6 @@ def make_engine_in(tmp_dir: str) -> tuple[DataEngine, Settings]:
     settings = Settings(
         db_path=str(Path(tmp_dir) / "test.db"),
         start_date="2024-01-01",
-        feishu_webhook_url="https://example.com/hook",
     )
     engine = DataEngine(settings)
     return engine, settings
@@ -40,7 +40,7 @@ def test_unique_symbol_date_constraint(symbol: str, trade_date: date) -> None:
             "volume": 1000.0, "turnover": 10500.0,
         }
         df = pd.DataFrame([row])
-        with sqlite3.connect(engine.db_path) as conn:
+        with closing(sqlite3.connect(engine.db_path)) as conn:
             df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi")
             try:
                 df.to_sql("stock_daily", conn, if_exists="append", index=False, method="multi")
@@ -50,4 +50,5 @@ def test_unique_symbol_date_constraint(symbol: str, trade_date: date) -> None:
                 "SELECT COUNT(*) FROM stock_daily WHERE symbol=? AND date=?",
                 (symbol, str(trade_date)),
             ).fetchone()[0]
+            conn.commit()
         assert count == 1

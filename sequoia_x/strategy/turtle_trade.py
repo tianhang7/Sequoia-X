@@ -15,12 +15,9 @@ class TurtleTradeStrategy(BaseStrategy):
     1. 突破新高：今日 close > 前20个交易日 high 的最大值
     2. 流动性：今日 turnover > 100,000,000
     3. 防诱多过滤：今日必须是实体阳线（今日 close > 今日 open），且必须真涨（今日 close > 昨日 close）
-
-    Attributes:
-        webhook_key: 路由到 'turtle' 专属飞书机器人。
     """
 
-    webhook_key: str = "turtle"
+    strategy_key: str = "turtle"
     _MIN_BARS: int = 21  # 至少需要 21 根 K 线（20日窗口 + 当日）
 
     def _get_market_caps(self, symbols: list[str]) -> dict[str, float]:
@@ -29,6 +26,8 @@ class TurtleTradeStrategy(BaseStrategy):
         流通股本 = 成交量 / (换手率% / 100)
         流通市值 = 流通股本 × 不复权收盘价
         """
+        import contextlib
+        import io
         from datetime import date
 
         import baostock as bs
@@ -36,7 +35,13 @@ class TurtleTradeStrategy(BaseStrategy):
         today_str = date.today().strftime("%Y-%m-%d")
         market_caps: dict[str, float] = {}
 
-        bs.login()
+        # baostock 会直接 print 报错文案，重定向以保持日志干净
+        with contextlib.redirect_stdout(io.StringIO()):
+            lg = bs.login()
+        if lg.error_code != "0":
+            # 登录失败（服务宕机）立即放弃：继续逐只 query 会每只都
+            # 阻塞到 socket 超时（104 只 × 10s ≈ 17 分钟）
+            return market_caps
         try:
             for symbol in symbols:
                 bs_code = self.engine._to_baostock_code(symbol)
@@ -48,6 +53,9 @@ class TurtleTradeStrategy(BaseStrategy):
                     frequency="d",
                     adjustflag="3",  # 不复权，真实价格
                 )
+                if rs.error_code != "0":
+                    # 服务异常时立即终止，避免剩余标的逐只等到超时
+                    break
                 while rs.next():
                     row = rs.get_row_data()
                     try:
@@ -64,16 +72,26 @@ class TurtleTradeStrategy(BaseStrategy):
 
         return market_caps
 
-    def run(self) -> list[str]:
+    def run(self, as_of: str | None = None) -> list[str]:
         """
         遍历全市场，返回满足海龟突破条件的股票代码列表。
+
+        Args:
+            as_of: 信号日；非 None 时只使用该日期及之前的K线，
+                且不联网查询市值（历史流通市值不可得），改用本地成交额降级排序。
+
+        Returns:
+            满足条件的股票代码列表。
         """
         symbols = self.engine.get_local_symbols()
         candidates: list[str] = []
+        avg_amounts: dict[str, float] = {}  # 降级排序用：20日均成交额
 
         for symbol in symbols:
             try:
                 df = self.engine.get_ohlcv(symbol)
+                if as_of is not None:
+                    df = df[df["date"] <= as_of]
                 if len(df) < self._MIN_BARS:
                     continue
 
@@ -97,15 +115,29 @@ class TurtleTradeStrategy(BaseStrategy):
 
                 if breakout and liquid and is_yang and is_up:
                     candidates.append(symbol)
+                    avg_amounts[symbol] = float(df["turnover"].tail(20).mean() or 0.0)
 
             except Exception as exc:
                 logger.warning(f"[{symbol}] TurtleTradeStrategy 计算失败：{exc}")
                 continue
 
-        # 按流通市值从大到小排序
+        # 按流通市值从大到小排序；市值不可得时降级为「20日均成交额」降序
         if candidates:
-            market_caps = self._get_market_caps(candidates)
-            candidates.sort(key=lambda s: market_caps.get(s, 0), reverse=True)
+            market_caps: dict[str, float] = {}
+            if as_of is None:
+                # 仅实时模式联网取市值；回测传历史日期时不查（当日市值会失真）
+                try:
+                    market_caps = self._get_market_caps(candidates)
+                except Exception as exc:
+                    logger.warning(f"TurtleTradeStrategy 获取流通市值失败：{exc}")
+
+            if market_caps:
+                candidates.sort(key=lambda s: market_caps.get(s, 0), reverse=True)
+            else:
+                candidates.sort(key=lambda s: avg_amounts.get(s, 0), reverse=True)
+                logger.warning(
+                    "TurtleTradeStrategy 流通市值不可用，已降级按 20 日均成交额降序排序"
+                )
 
         logger.info(f"TurtleTradeStrategy 选出 {len(candidates)} 只股票")
         return candidates

@@ -16,17 +16,17 @@ class LimitUpShakeoutStrategy(BaseStrategy):
     2. 今日收阴：今日 close < 今日 open
     3. 今日放量：今日 volume > 昨日 volume * 2.0
     4. 支撑不破：今日 low >= 昨日 close
-
-    Attributes:
-        webhook_key: 路由到 'shakeout' 专属飞书机器人。
     """
 
-    webhook_key: str = "shakeout"
+    strategy_key: str = "shakeout"
     _MIN_BARS: int = 3  # 至少需要 3 根 K 线（前日、昨日、今日）
 
-    def run(self) -> list[str]:
+    def run(self, as_of: str | None = None) -> list[str]:
         """
         遍历全市场，返回满足涨停洗盘条件的股票代码列表。
+
+        Args:
+            as_of: 信号日；非 None 时只使用该日期及之前的K线。
 
         Returns:
             满足条件的股票代码列表。
@@ -37,6 +37,8 @@ class LimitUpShakeoutStrategy(BaseStrategy):
         for symbol in symbols:
             try:
                 df = self.engine.get_ohlcv(symbol)
+                if as_of is not None:
+                    df = df[df["date"] <= as_of]
                 if len(df) < self._MIN_BARS:
                     continue
 

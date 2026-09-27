@@ -12,12 +12,11 @@ class BaseStrategy(ABC):
     所有具体策略必须继承此类并实现 run() 方法。
 
     Attributes:
-        webhook_key: 策略对应的飞书 webhook 标识，用于路由到不同机器人。
-            默认为 'default'，将使用 Settings.feishu_webhook_url。
-            子类可覆盖此属性以路由到专属机器人，例如 'ma_volume'。
+        strategy_key: 策略短标识，供 CLI/回测（--bt-strategies）以简称
+            引用策略，例如 'ma_volume'、'turtle'。子类应覆盖此属性。
     """
 
-    webhook_key: str = "default"
+    strategy_key: str = "default"
 
     def __init__(self, engine: DataEngine, settings: Settings) -> None:
         """
@@ -31,9 +30,14 @@ class BaseStrategy(ABC):
         self.settings = settings
 
     @abstractmethod
-    def run(self) -> list[str]:
+    def run(self, as_of: str | None = None) -> list[str]:
         """
         执行选股逻辑，返回选中的股票代码列表。
+
+        Args:
+            as_of: 信号日（ISO 日期，如 '2026-09-25'）。为 None 时使用库内
+                全部数据（日常模式）；回测时必须传入历史日期，且策略实现
+                必须保证不使用该日期之后的任何数据（防止前视偏差）。
 
         Returns:
             满足策略条件的股票代码列表，如 ['000001', '600519']。
