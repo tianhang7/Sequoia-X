@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     position_stop_loss: float = 0.07  # 硬止损：买入价 × (1 - 该比例)
     position_time_stop_days: int = 10  # 时间止损：持有 N 个交易日仍不盈利则提醒离场
 
+    # ── 数据源偏好（见 sequoia_x/data/eastmoney.py）──
+    # eastmoney: 东财公开接口优先（免登录），失败自动降级 baostock；
+    # baostock: 只用 baostock（东财被封/不可用时应急）。
+    price_source: str = "eastmoney"
+    price_workers: int = 8  # 东财线程池并发数（IO 密集，Windows 友好）
+
     # ── 原始价同步（见 sequoia_x/data/engine.py）──
     enable_raw_prices: bool = True  # 日常增量/回填是否同步不复权收盘价（下单用）
 

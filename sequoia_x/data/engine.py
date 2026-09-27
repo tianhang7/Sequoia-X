@@ -353,14 +353,24 @@ def fetch_stock_names_from_baostock(max_retries: int = 2) -> dict[str, str]:
 
 
 class DataEngine:
-    """行情数据引擎，负责 SQLite 存储和 baostock 数据同步。"""
+    """行情数据引擎：SQLite 存储 + 双源同步（东财优先、baostock 兜底）。
+
+    后复权 ``close``（策略/回测用）与不复权 ``raw_close``（下单/展示用）
+    同源写入；任一源失败时自动降级，保证不断流。
+    """
 
     def __init__(self, settings: Settings) -> None:
         self.db_path: str = settings.db_path
         self.start_date: str = settings.start_date
         # 原始价开关：关闭时增量同步跳过第二轮不复权抓取（省一半请求）
         self.enable_raw_prices: bool = getattr(settings, "enable_raw_prices", True)
+        # 数据源偏好：eastmoney（默认）/ baostock（应急直连）
+        self.price_source: str = getattr(settings, "price_source", "eastmoney")
+        self.price_workers: int = int(getattr(settings, "price_workers", 8) or 8)
         self._init_db()
+
+    def _use_eastmoney(self) -> bool:
+        return self.price_source != "baostock"
 
     def _init_db(self) -> None:
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -439,11 +449,13 @@ class DataEngine:
 
     # ── 数据同步 ──
 
-    def sync_today_bulk(self, fetcher=None) -> int:
-        """多进程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。
+    def sync_today_bulk(self, fetcher=None, eastmoney=None) -> int:
+        """增量同步：东财优先（免登录）、baostock 兜底，一次写两列。
 
-        其中 ``fetcher`` 仅用于单元测试：传入后两轮抓取都走串行单线程路径
-        （跳过 multiprocessing.Pool，避免无网络环境 fork 子进程）。
+        其中 ``fetcher`` 仅用于单元测试：传入后两轮抓取都走 baostock 替身
+        串行路径（跳过 multiprocessing.Pool，避免无网络环境 fork 子进程）。
+        ``eastmoney`` 为测试注入的东财抓取模块替身（须提供 ``fetch_windows``
+        函数），传入时同样走串行路径。
         """
         from datetime import date, timedelta
         from multiprocessing import Pool
@@ -483,52 +495,115 @@ class DataEngine:
             logger.info("所有股票已是最新，无需更新")
             return 0
 
-        logger.info(f"需要更新 {len(tasks)} 只股票，启动多进程并行拉取...")
+        logger.info(f"需要更新 {len(tasks)} 只股票，启动并行拉取...")
 
-        n_workers = min(8, len(tasks))
-        chunks = [tasks[i::n_workers] for i in range(n_workers)]
+        # 每只起点不同：[(symbol, start, end)] 供东财按窗口拉取
+        windows = [(symbol, start, end) for symbol, _, start, end in tasks]
 
         if fetcher is not None:
             # 单元测试路径：串行单线程抓取后复权数据
             all_rows = _bs_fetch_batch(tasks, fetcher=fetcher)
+            raw_rows = _bs_fetch_raw(tasks, fetcher=fetcher) if self.enable_raw_prices else []
+            raw_pending = False
+        elif self._use_eastmoney():
+            # 主力：东财线程池双口径同源拉取（后复权 close + 不复权 raw_close）
+            all_rows, raw_rows = self._sync_via_eastmoney(windows, eastmoney=eastmoney)
+            raw_pending = False  # 东财路径 raw 已同源写入，无需第二轮
         else:
+            n_workers = min(8, len(tasks))
+            chunks = [tasks[i::n_workers] for i in range(n_workers)]
             with Pool(n_workers) as pool:
                 batch_results = pool.map(_bs_fetch_batch, chunks)
 
             all_rows = []
             for batch in batch_results:
                 all_rows.extend(batch)
+            raw_pending = self.enable_raw_prices
         if not all_rows:
             logger.info("无新数据（可能非交易日）")
             return 0
 
+        if raw_pending:
+            # baostock 路径第二轮：同窗口拉不复权收盘价，失败仅告警
+            try:
+                n_raw = min(4, len(tasks))
+                raw_chunks = [tasks[i::n_raw] for i in range(n_raw)]
+                with Pool(n_raw) as pool:
+                    raw_batches = pool.map(_bs_fetch_raw, raw_chunks)
+                raw_rows = [r for b in raw_batches for r in b]
+            except Exception as exc:  # noqa: BLE001 - 第一轮已落库成功，静默降级
+                logger.warning(f"不复权收盘价同步失败（已降级为纯后复权写入）：{exc}")
+                raw_rows = []
+
+        return self._write_sync_frame(all_rows, raw_rows)
+
+    def _sync_via_eastmoney(self, windows: list, eastmoney=None) -> tuple[list, list]:
+        """搜狐不复权 + 东财 push2 后复权双源拉取，失败只降级 baostock。
+
+        返回 (hfq_rows, raw_rows)：
+        - 后复权 close：东财 push2 fqt=2（策略/回测用；空壳 dktotal=0 时重试
+          后仍缺失的子集走 baostock 补拉）；
+        - 不复权 raw_close：搜狐 hisHq（可执行价；缺失行记 NULL 不阻断落库）。
+        ``eastmoney`` 为测试替身模块（须提供 FQT_HFQ/FQT_RAW、fetch_windows、
+        fetch_sohu_many 三者之一按需提供）。
+        """
+        from multiprocessing import Pool
+
+        from sequoia_x.data import eastmoney as em
+
+        mod = eastmoney if eastmoney is not None else em
+        fetch_hfq = getattr(mod, "fetch_windows", None)
+        fetch_sohu = getattr(mod, "fetch_sohu_many", None)
+        hfq_rows, hfq_failed = (fetch_hfq(windows, fqt=mod.FQT_HFQ,
+                                          max_workers=self.price_workers)
+                                if fetch_hfq else ([], [w[0] for w in windows]))
+        raw_rows, raw_failed = ([], [])
+        if self.enable_raw_prices and fetch_sohu:
+            symbols = [w[0] for w in windows]
+            starts = min(w[1] for w in windows)
+            ends = max(w[2] for w in windows)
+            sohu_rows, raw_failed = fetch_sohu(symbols, starts, ends,
+                                              max_workers=self.price_workers)
+            # 搜狐行格式 [s,date,o,h,l,close,vol,turnover] → 归一化为 [s,date,close]，
+            # 与 baostock _bs_fetch_raw 输出对齐（_write_sync_frame 取 r[2] 为收盘）。
+            raw_rows = [[r[0], r[1], r[5]] for r in sohu_rows if len(r) > 5]
+        if hfq_failed:
+            # 兜底：仅对东财失败子集走 baostock 补拉（进程池与原来一致）
+            logger.warning(f"东财 {len(hfq_failed)} 只失败，降级 baostock 补拉")
+            failed_set = set(hfq_failed)
+            bs_tasks = [t for t in
+                        [(s, self._to_baostock_code(s), st, e) for s, st, e in windows]
+                        if t[0] in failed_set]
+            n_workers = min(8, len(bs_tasks))
+            chunks = [bs_tasks[i::n_workers] for i in range(n_workers)]
+            with Pool(n_workers) as pool:
+                for batch in pool.map(_bs_fetch_batch, chunks):
+                    hfq_rows.extend(batch)
+            if self.enable_raw_prices:
+                n_raw = min(4, len(bs_tasks))
+                raw_chunks = [bs_tasks[i::n_raw] for i in range(n_raw)]
+                with Pool(n_raw) as pool:
+                    for batch in pool.map(_bs_fetch_raw, raw_chunks):
+                        # _bs_fetch_raw 已是 [s,date,close]，直接拼接
+                        raw_rows.extend(batch)
+        if raw_failed:
+            logger.warning(f"搜狐不复权价 {len(raw_failed)} 只缺失（raw_close 记 NULL）")
+        return hfq_rows, raw_rows
+
+    def _write_sync_frame(self, all_rows: list, raw_rows: list) -> int:
+        """把增量行落库（后复权 close + 不复权 raw_close 同源对齐），返回写入行数。"""
         df = pd.DataFrame(all_rows, columns=["symbol", "date", "open", "high", "low", "close", "volume", "turnover"])
         for col in ["open", "high", "low", "close", "volume", "turnover"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["close"])
         df = df[df["volume"] > 0]
 
-        if self.enable_raw_prices:
-            # 第二轮：同窗口拉不复权收盘价（可执行价），失败仅告警，缺失行补 NULL
-            try:
-                if fetcher is not None:
-                    raw_rows = _bs_fetch_raw(tasks, fetcher=fetcher)
-                else:
-                    n_raw = min(4, len(tasks))
-                    raw_chunks = [tasks[i::n_raw] for i in range(n_raw)]
-                    with Pool(n_raw) as pool:
-                        raw_batches = pool.map(_bs_fetch_raw, raw_chunks)
-                    raw_rows = [r for b in raw_batches for r in b]
-                raw_map = {(r[0], r[1]): r[2] for r in raw_rows}
-                df["raw_close"] = [
-                    pd.to_numeric(raw_map.get((s, d)), errors="coerce")
-                    for s, d in zip(df["symbol"], df["date"])
-                ]
-                raw_hit = int(df["raw_close"].notna().sum())
-                logger.info(f"sync_today_bulk: 不复权价写入 {raw_hit}/{len(df)} 行")
-            except Exception as exc:  # noqa: BLE001 - 第一轮已落库成功，静默降级
-                logger.warning(f"不复权收盘价同步失败（已降级为纯后复权写入）：{exc}")
-                df["raw_close"] = pd.NA
+        raw_map = {(r[0], r[1]): r[2] for r in (raw_rows or [])}
+        if raw_map:
+            df["raw_close"] = [pd.to_numeric(raw_map.get((s, d)), errors="coerce")
+                               for s, d in zip(df["symbol"], df["date"])]
+            raw_hit = int(df["raw_close"].notna().sum())
+            logger.info(f"sync_today_bulk: 不复权价写入 {raw_hit}/{len(df)} 行")
         else:
             df["raw_close"] = pd.NA
 
@@ -653,24 +728,24 @@ class DataEngine:
             preview = ", ".join(failed_symbols[:20])
             logger.warning(f"以下股票拉取失败（可重跑续传补齐）: {preview} ...")
 
-    def backfill_raw(self, symbols: list[str], n_workers: int = 8, fetcher=None) -> dict:
-        """老库补齐不复权收盘价（adjustflag=\"3\"，UPDATE 已有行，不新增行）。
+    def backfill_raw(self, symbols: list[str], n_workers: int = 8, fetcher=None, eastmoney=None) -> dict:
+        """老库补齐不复权收盘价（搜狐 hisHq 优先、baostock 兜底，UPDATE 已有行）。
 
         可重跑/续传：已补齐（同 window 内 raw_close 全非空）的股票自动跳过；
         失败股票上报 `failed`，下次重跑时继续尝试。
 
         Args:
             symbols: 待处理的股票代码列表（原样传入）。
-            n_workers: 进程数。
-            fetcher: 测试注入的抓取函数（单元测试无网络时使用），传入后
-                跳过 multiprocessing.Pool，走串行单线程路径。
+            n_workers: baostock 兜底进程数（东财用 price_workers 线程池）。
+            fetcher: 测试注入的 baostock 抓取函数；eastmoney: 测试注入的
+                东财模块替身（须提供 FQT_RAW 与 fetch_many），两者传入其一
+                即走串行单线程路径（单元测试无网络时使用）。
 
         Returns:
             dict: {"updated": 更新行数, "skipped": 已齐跳过的股票数,
                 "failed": 失败股票代码列表}。
         """
         from datetime import date
-        from multiprocessing import Pool
 
         today_str = date.today().strftime("%Y-%m-%d")
         window_start = self.start_date
@@ -692,6 +767,7 @@ class DataEngine:
                 skipped += 1
                 continue
             tasks.append((symbol, self._to_baostock_code(symbol), window_start, today_str))
+        pending = [t[0] for t in tasks]
 
         if not tasks:
             logger.info(f"全部 {len(symbols)} 只股票的不复权价已齐，无需补拉")
@@ -699,8 +775,35 @@ class DataEngine:
 
         if fetcher is not None:
             raw_rows = _bs_fetch_raw(tasks, fetcher=fetcher)
-            failed: list = []
+        elif eastmoney is not None:
+            # 测试替身：须提供 fetch_sohu_many（搜狐行格式 [s,date,o,h,l,c,v,t]，
+            # 其中 c 即不复权收盘；_update_raw_prices 只取 [s,date,close]）。
+            sohu_rows, _ = eastmoney.fetch_sohu_many(
+                pending, window_start, today_str, max_workers=self.price_workers)
+            raw_rows = [[r[0], r[1], r[5]] for r in sohu_rows]
+        elif self._use_eastmoney():
+            from sequoia_x.data import eastmoney as em
+
+            logger.info(f"需补不复权价 {len(tasks)} 只（已齐跳过 {skipped}），搜狐优先拉取...")
+            raw_rows, sohu_failed = em.fetch_sohu_many(
+                pending, window_start, today_str, max_workers=self.price_workers)
+            # 搜狐行格式 [s,date,o,h,l,close,vol,turnover] → _update_raw_prices 用 [s,date,close]
+            raw_rows = [[r[0], r[1], r[5]] for r in raw_rows]
+            if sohu_failed:
+                # 兜底：仅对搜狐失败子集走 baostock 补拉
+                from multiprocessing import Pool
+
+                logger.warning(f"搜狐 {len(sohu_failed)} 只失败，降级 baostock 补拉")
+                failed_set = set(sohu_failed)
+                bs_tasks = [t for t in tasks if t[0] in failed_set]
+                n_bs = max(1, min(n_workers, len(bs_tasks)))
+                chunks = [bs_tasks[i::n_bs] for i in range(n_bs)]
+                with Pool(n_bs) as pool:
+                    for batch in pool.map(_bs_fetch_raw, chunks):
+                        raw_rows.extend(batch)
         else:
+            from multiprocessing import Pool
+
             n_workers = max(1, min(n_workers, len(tasks)))
             chunks = [tasks[i::n_workers] for i in range(n_workers)]
             logger.info(
@@ -710,7 +813,6 @@ class DataEngine:
             with Pool(n_workers) as pool:
                 batches = pool.map(_bs_fetch_raw, chunks)
             raw_rows = [r for b in batches for r in b]
-            failed = []
 
         updated = self._update_raw_prices(raw_rows)
         fetched = {r[0] for r in raw_rows}
