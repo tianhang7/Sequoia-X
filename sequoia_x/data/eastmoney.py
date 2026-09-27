@@ -36,6 +36,7 @@ FQT_HFQ = 2
 _PAGE_LIMIT = 1000  # 单次请求最多返回条数（实测 1000 安全）
 _TIMEOUT = 15
 _RETRIES = 3
+_SOHU_BACKOFF = (2, 5, 10)  # 搜狐 503/429 限流时退避秒数（全量补拉必被限流）
 
 # push2his 无 UA/Referer 时直接断连接（RemoteDisconnected），必须带浏览器头
 _HEADERS = {
@@ -43,6 +44,22 @@ _HEADERS = {
                   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
     "Referer": "https://quote.eastmoney.com/",
 }
+
+_SESSION: requests.Session | None = None
+
+
+def _session() -> requests.Session:
+    """复用 TCP 连接的 Session（5000+ 请求时避免每次建连；带浏览器头）。"""
+    global _SESSION
+    if _SESSION is None:
+        sess = requests.Session()
+        sess.headers.update(_HEADERS)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16,
+                                                max_retries=0)
+        sess.mount("https://", adapter)
+        sess.mount("http://", adapter)
+        _SESSION = sess
+    return _SESSION
 
 
 def to_secid(symbol: str) -> str:
@@ -103,15 +120,17 @@ def fetch_sohu(symbol: str, start: str, end: str, requester=None) -> list:
         data = None
         for attempt in range(_RETRIES):
             try:
-                resp = requests.get(SOHU_URL, params=params, timeout=_TIMEOUT,
-                                    headers={"User-Agent": _HEADERS["User-Agent"]})
+                resp = _session().get(SOHU_URL, params=params, timeout=_TIMEOUT)
+                if resp.status_code in (429, 503):
+                    raise RuntimeError(f"HTTP={resp.status_code}（限流，退避重试）")
                 if resp.status_code != 200:
                     raise RuntimeError(f"HTTP={resp.status_code}")
                 data = resp.json()
                 break
             except Exception as exc:  # noqa: BLE001 - 重试后仍失败则本只记缺失
-                logger.warning(f"搜狐 K 线 {symbol} 失败（{attempt + 1}/{_RETRIES}）: {exc}")
-                time.sleep(1 + attempt)
+                wait = _SOHU_BACKOFF[min(attempt, len(_SOHU_BACKOFF) - 1)]
+                logger.warning(f"搜狐 K 线 {symbol} 失败（{attempt + 1}/{_RETRIES}，{wait}s 后重试）: {exc}")
+                time.sleep(wait)
         if data is None:
             return []
     hq = ((data or [{}])[0] or {}).get("hq") or []
@@ -120,9 +139,15 @@ def fetch_sohu(symbol: str, start: str, end: str, requester=None) -> list:
     return [r for r in rows if beg <= r[1].replace("-", "") <= end_c]
 
 
-def fetch_sohu_many(symbols, start, end, max_workers=8, requester=None):
-    """搜狐多只并发；返回 (rows, failed_symbols)。requester 传入时退化串行。"""
+def fetch_sohu_many(symbols, start, end, max_workers=8, requester=None, delay=0.0):
+    """搜狐多只并发；返回 (rows, failed_symbols)。requester 传入时退化串行。
+
+    ``delay``：每次请求前 sleep 秒数（搜狐限流时建议 0.15~0.3，
+    配合 max_workers=4；单只 2~3s + 成功后仍需节流）。
+    """
     def _one(symbol):
+        if delay:
+            time.sleep(delay)
         return fetch_sohu(symbol, start, end, requester=requester)
 
     rows, failed = [], []

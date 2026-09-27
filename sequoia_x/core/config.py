@@ -31,7 +31,8 @@ class Settings(BaseSettings):
     # eastmoney: 东财公开接口优先（免登录），失败自动降级 baostock；
     # baostock: 只用 baostock（东财被封/不可用时应急）。
     price_source: str = "eastmoney"
-    price_workers: int = 8  # 东财线程池并发数（IO 密集，Windows 友好）
+    price_workers: int = 4  # 搜狐/东财线程池并发数（IO 密集；搜狐限流时 4 + 节流）
+    sohu_delay: float = 0.2  # 搜狐每次请求前等待秒数（全量补拉被 503 时 0.2~0.3）
 
     # ── 原始价同步（见 sequoia_x/data/engine.py）──
     enable_raw_prices: bool = True  # 日常增量/回填是否同步不复权收盘价（下单用）

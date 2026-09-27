@@ -367,6 +367,8 @@ class DataEngine:
         # 数据源偏好：eastmoney（默认）/ baostock（应急直连）
         self.price_source: str = getattr(settings, "price_source", "eastmoney")
         self.price_workers: int = int(getattr(settings, "price_workers", 8) or 8)
+        # 搜狐节流：每次请求前 sleep 秒数；全量补拉被 503 限流时调大（0.2~0.3）
+        self.sohu_delay: float = float(getattr(settings, "sohu_delay", 0.0) or 0.0)
         self._init_db()
 
     def _use_eastmoney(self) -> bool:
@@ -785,10 +787,23 @@ class DataEngine:
             from sequoia_x.data import eastmoney as em
 
             logger.info(f"需补不复权价 {len(tasks)} 只（已齐跳过 {skipped}），搜狐优先拉取...")
-            raw_rows, sohu_failed = em.fetch_sohu_many(
-                pending, window_start, today_str, max_workers=self.price_workers)
-            # 搜狐行格式 [s,date,o,h,l,close,vol,turnover] → _update_raw_prices 用 [s,date,close]
-            raw_rows = [[r[0], r[1], r[5]] for r in raw_rows]
+            # 分批断点续写：每批拉完即 UPDATE 落库，中断重跑时已补批次自动跳过，
+            # 避免 5000+ 只全拉完才写一次（被限流杀掉则零进度）。
+            raw_rows: list = []
+            sohu_failed: list = []
+            batch_size = 100
+            done = 0
+            for i in range(0, len(pending), batch_size):
+                chunk = pending[i:i + batch_size]
+                chunk_rows, chunk_failed = em.fetch_sohu_many(
+                    chunk, window_start, today_str, max_workers=self.price_workers,
+                    delay=self.sohu_delay)
+                chunk_raw = [[r[0], r[1], r[5]] for r in chunk_rows]
+                n = self._update_raw_prices(chunk_raw)
+                raw_rows.extend(chunk_raw)
+                sohu_failed.extend(chunk_failed)
+                done += len(chunk)
+                logger.info(f"补拉进度 {done}/{len(pending)}，本批写入 {n} 行，累计失败 {len(sohu_failed)} 只")
             if sohu_failed:
                 # 兜底：仅对搜狐失败子集走 baostock 补拉
                 from multiprocessing import Pool
@@ -814,9 +829,16 @@ class DataEngine:
                 batches = pool.map(_bs_fetch_raw, chunks)
             raw_rows = [r for b in batches for r in b]
 
-        updated = self._update_raw_prices(raw_rows)
         fetched = {r[0] for r in raw_rows}
         failed = [t[0] for t in tasks if t[0] not in fetched]
+        if self._use_eastmoney() and fetcher is None and eastmoney is None:
+            # 搜狐分批路径已逐批 UPDATE 落库：用覆盖率反查实际补齐行数
+            with _connect(self.db_path, timeout=60.0) as conn:
+                row = conn.execute(
+                    "SELECT SUM(raw_close IS NOT NULL) FROM stock_daily").fetchone()
+            updated = int(row[0] or 0)
+        else:
+            updated = self._update_raw_prices(raw_rows)
         logger.info(
             f"不复权价补齐完成 — 更新 {updated} 行 | "
             f"已齐跳过 {skipped} 只 | 失败 {len(failed)} 只"
