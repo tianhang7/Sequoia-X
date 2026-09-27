@@ -24,6 +24,7 @@ UTF-8 日志落盘、信号级回测（`--backtest`），测试套件基于 hypo
 python main.py                 # 日常模式：增量补数据 → 数据新鲜度断言 → 持仓卖出评估
                                #           → 策略选股 + 过滤 → 归档 + 当日操作手册 → Telegram 推送
 python main.py --backfill      # 回填模式：8进程并行灌入全市场历史K线（可中断续传）
+python main.py --backfill-raw  # 补拉模式：仅补不复权收盘价 raw_close（老库升级/缺口续传用）
 python main.py --backtest      # 回测模式：验证策略历史信号质量（不推送任何消息）
 python main.py --position-list # 查看持仓与复盘统计
 python main.py --position-exits# 仅评估持仓卖出条件（不推送）
@@ -81,6 +82,12 @@ python main.py --backfill
 ```
 
 约 12 分钟完成 ~5200 只 A 股历史后复权日 K 数据回填（可中断续传，已回填部分自动跳过）。
+回填同时写入不复权收盘价 `raw_close`（下单用，`ENABLE_RAW_PRICES=false` 可关闭省一半请求）。
+老库升级（一键补齐历史 `raw_close`，可重跑续传）：
+
+```bash
+python main.py --backfill-raw
+```
 
 ### 4. 日常运行
 
@@ -160,7 +167,10 @@ python main.py --position-exits             # 手动评估卖出条件（不推�
   「建议买入」（收盘价参考 / 建议限价 / 止损价 / 止盈目标，跨策略命中自动去重），
   末尾附一页式执行清单，次日按图操作即可；同日重跑覆盖旧文件，无信号时也留档；
   止盈比例 `MANUAL_TAKE_PROFIT=0.20`（止损沿用 `POSITION_STOP_LOSS`）；
-  注意库内价格为后复权口径，表中价格用于表达相对比例，下单以行情软件实时价为准；
+  价格口径一律用不复权原始价（`raw_close`，可直接参考下单），缺失时降级后复权并
+  逐条打标「后复权」，顶部给出原始价覆盖率；
+  日常运行时手册摘要（卖出/买入数量 + 各前 N 条，`MANUAL_PUSH_TOP_N=10`，0=不推送）
+  一并推 Telegram，全文仍在 Markdown 文件中；
 - 运行日志同步写入 `LOG_FILE`（默认 `log.txt`，UTF-8；置空则仅控制台）。
 
 ### 5. 历史回测（验证策略信号质量）
@@ -226,7 +236,8 @@ Sequoia-X/
 ## 数据说明
 
 - **数据源**：[baostock](http://baostock.com)（免费、无需注册、无限流）；定增事件与交易日历来自 akshare/新浪
-- **复权方式**：后复权（hfq）— 历史价格不变，适合增量存储，避免除权导致数据错乱
+- **复权方式**：后复权（hfq）— 历史价格不变，适合增量存储，避免除权导致数据错乱；
+  另存不复权收盘价 `raw_close` 专供下单/展示（持仓提醒、手册目标价均优先用它）
 - **存储**：本地 SQLite（`data/sequoia_v2.db`），可直接拷贝到其他机器使用
   - `stock_daily` 行情主表、`stock_name` 名称缓存（ST 判定）、
     `position` 持仓与复盘、`meta` 键值（新鲜度告警标记等）

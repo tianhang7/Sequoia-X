@@ -27,7 +27,7 @@ from sequoia_x.core.config import Settings, get_settings
 from sequoia_x.core.logger import configure_file_logging, get_logger
 from sequoia_x.core.trading_calendar import TradingCalendar
 from sequoia_x.data.engine import DataEngine
-from sequoia_x.manual import generate_manual
+from sequoia_x.manual import _merge_candidates, build_push_summary, generate_manual
 from sequoia_x.notify.telegram import TelegramNotifier
 from sequoia_x.portfolio import PositionManager
 from sequoia_x.strategy.base import BaseStrategy
@@ -83,6 +83,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--backfill",
         action="store_true",
         help="回填模式：通过 baostock 拉取全市场历史 K 线（约12分钟）",
+    )
+    parser.add_argument(
+        "--backfill-raw",
+        dest="backfill_raw",
+        action="store_true",
+        help="补拉模式：仅补齐 stock_daily 的不复权收盘价 raw_close（可重跑续传）",
     )
 
     # ── 回测模式 ──
@@ -140,6 +146,20 @@ def main() -> None:
             all_symbols = engine.get_all_symbols()
             engine.backfill(all_symbols)
             logger.info("Sequoia-X V2 回填模式运行完成")
+            return
+
+        if args.backfill_raw:
+            # ── 补拉模式：仅补不复权收盘价（UPDATE 已有行，不新增行，可重跑续传）──
+            logger.info("进入不复权价补拉模式...")
+            local_symbols = engine.get_local_symbols()
+            if not local_symbols:
+                logger.error("本地库无K线数据，请先执行 python main.py --backfill 完成首次回填")
+                raise SystemExit(1)
+            result = engine.backfill_raw(local_symbols)
+            logger.info(
+                f"补拉完成：更新 {result['updated']} 行 / "
+                f"已齐跳过 {result['skipped']} 只 / 失败 {len(result['failed'])} 只"
+            )
             return
 
         # ── 持仓管理子命令（不同步数据、不跑策略、不推送）──
@@ -264,6 +284,25 @@ def main() -> None:
                 selections=selections,
             )
             logger.info(f"当日操作手册：{manual_path}")
+            # 8.1 手册摘要推送（买卖数量 + 各前 N 条；N=0 或未配置凭证时跳过）
+            if settings.manual_push_top_n > 0:
+                if tg_notifier.is_enabled:
+                    candidates = _merge_candidates(selections)
+                    all_manual_symbols = [s.symbol for s in exit_signals] + list(candidates)
+                    manual_names = (
+                        engine.get_stock_names(all_manual_symbols) if all_manual_symbols else {}
+                    )
+                    summary = build_push_summary(
+                        as_of,
+                        exit_signals,
+                        candidates,
+                        manual_names,
+                        top_n=settings.manual_push_top_n,
+                    )
+                    if summary:
+                        tg_notifier.send_alert("当日操作手册摘要", summary, emoji="📋")
+                else:
+                    logger.info("手册摘要未推送：Telegram 未配置凭证")
         except Exception as manual_exc:  # noqa: BLE001 - 辅助产物，失败仅告警
             logger.warning(f"操作手册生成失败（不影响主流程）：{manual_exc}")
 

@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS stock_daily (
     close    REAL,
     volume   REAL,
     turnover REAL,
+    raw_close REAL,  -- 不复权原始收盘价：下单/展示用；老库由 _init_db 自动加列
     UNIQUE (symbol, date)
 );
 """
@@ -89,12 +90,32 @@ def _connect(db_path: str, timeout: float = 5.0) -> Iterator[sqlite3.Connection]
         conn.close()
 
 
-def _bs_fetch_batch(tasks: list) -> list:
+def _bs_fetch_batch(tasks: list, fetcher=None) -> list:
     """多进程 worker：独立 login，批量拉取 baostock 数据。
 
     登录失败立即返回空列表：baostock 宕机时若继续逐只 query，
     每只都会各自阻塞到超时（653 只/worker × 10s ≈ 小时级卡死进程池）。
+
+    Args:
+        fetcher: 测试注入的抓取函数，传入时走串行单线程路径并跳过 login。
     """
+    if fetcher is not None:
+        results = []
+        for symbol, bs_code, start, end in tasks:
+            rs = fetcher(
+                bs_code,
+                "date,open,high,low,close,volume,amount",
+                start_date=start,
+                end_date=end,
+                frequency="d",
+                adjustflag="1",
+            )
+            if rs.error_code != "0":
+                continue
+            while rs.next():
+                results.append([symbol] + rs.get_row_data())
+        return results
+
     import contextlib
     import io
 
@@ -119,6 +140,63 @@ def _bs_fetch_batch(tasks: list) -> list:
             continue
         while rs.next():
             results.append([symbol] + rs.get_row_data())
+    bs.logout()
+    return results
+
+
+def _bs_fetch_raw(tasks: list, fetcher=None) -> list:
+    """多进程 worker：同窗口以 adjustflag=\"3\" 拉取不复权收盘价。
+
+    返回 [symbol, date, raw_close]。baostock 宕机时行为与 ``_bs_fetch_batch``
+    一致：登录失败直接返回空列表，由调用方补写 NULL（老库格式）。
+
+    Args:
+        tasks: [(symbol, bs_code, start, end)]。
+        fetcher: 测试注入的抓取函数，签名同 ``bs.query_history_k_data_plus``，
+            传入时走串行单线程路径（单元测试无网络时使用），并跳过 login/logout。
+    """
+    if fetcher is not None:
+        results = []
+        for symbol, bs_code, start, end in tasks:
+            rs = fetcher(
+                bs_code,
+                "date,open,high,low,close,volume,amount",
+                start_date=start,
+                end_date=end,
+                frequency="d",
+                adjustflag="3",
+            )
+            if rs.error_code != "0":
+                continue
+            while rs.next():
+                row = rs.get_row_data()
+                results.append([symbol, row[0], row[4]])
+        return results
+
+    import contextlib
+    import io
+
+    import baostock as bs
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        lg = bs.login()
+    if lg.error_code != "0":
+        return []
+    results = []
+    for symbol, bs_code, start, end in tasks:
+        rs = bs.query_history_k_data_plus(
+            bs_code,
+            "date,open,high,low,close,volume,amount",
+            start_date=start,
+            end_date=end,
+            frequency="d",
+            adjustflag="3",  # 不复权：下单用的原始价格
+        )
+        if rs.error_code != "0":
+            continue
+        while rs.next():
+            row = rs.get_row_data()
+            results.append([symbol, row[0], row[4]])
     bs.logout()
     return results
 
@@ -280,6 +358,8 @@ class DataEngine:
     def __init__(self, settings: Settings) -> None:
         self.db_path: str = settings.db_path
         self.start_date: str = settings.start_date
+        # 原始价开关：关闭时增量同步跳过第二轮不复权抓取（省一半请求）
+        self.enable_raw_prices: bool = getattr(settings, "enable_raw_prices", True)
         self._init_db()
 
     def _init_db(self) -> None:
@@ -291,6 +371,11 @@ class DataEngine:
             conn.execute(_CREATE_META_TABLE_SQL)
             conn.execute(_CREATE_POSITION_TABLE_SQL)
             conn.execute(_CREATE_POSITION_INDEX_SQL)
+            # 老库迁移：stock_daily 没有 raw_close 列时自动补列（幂等，可重跑）
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(stock_daily)")}
+            if "raw_close" not in cols:
+                conn.execute("ALTER TABLE stock_daily ADD COLUMN raw_close REAL")
+                logger.info("stock_daily 已补 raw_close 列（老库迁移）")
             conn.commit()
         logger.info(f"数据库初始化完成：{self.db_path}")
 
@@ -333,6 +418,19 @@ class DataEngine:
             )
         return df
 
+    def get_raw_close(self, symbol: str) -> tuple[str, float] | None:
+        """取最新一条不复权收盘价，返回 (date, raw_close)，缺失时返回 None。"""
+        with _connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT date, raw_close FROM stock_daily "
+                "WHERE symbol = ? AND raw_close IS NOT NULL "
+                "ORDER BY date DESC LIMIT 1",
+                (symbol,),
+            ).fetchone()
+        if not row:
+            return None
+        return row[0], float(row[1])
+
     @staticmethod
     def _to_baostock_code(symbol: str) -> str:
         """将纯数字代码转为 baostock 格式：6/9开头 -> sh，其余 -> sz。"""
@@ -341,8 +439,12 @@ class DataEngine:
 
     # ── 数据同步 ──
 
-    def sync_today_bulk(self) -> int:
-        """多进程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。"""
+    def sync_today_bulk(self, fetcher=None) -> int:
+        """多进程并行通过 baostock 拉取增量数据（后复权），写入 SQLite。
+
+        其中 ``fetcher`` 仅用于单元测试：传入后两轮抓取都走串行单线程路径
+        （跳过 multiprocessing.Pool，避免无网络环境 fork 子进程）。
+        """
         from datetime import date, timedelta
         from multiprocessing import Pool
 
@@ -386,13 +488,16 @@ class DataEngine:
         n_workers = min(8, len(tasks))
         chunks = [tasks[i::n_workers] for i in range(n_workers)]
 
-        with Pool(n_workers) as pool:
-            batch_results = pool.map(_bs_fetch_batch, chunks)
+        if fetcher is not None:
+            # 单元测试路径：串行单线程抓取后复权数据
+            all_rows = _bs_fetch_batch(tasks, fetcher=fetcher)
+        else:
+            with Pool(n_workers) as pool:
+                batch_results = pool.map(_bs_fetch_batch, chunks)
 
-        all_rows = []
-        for batch in batch_results:
-            all_rows.extend(batch)
-
+            all_rows = []
+            for batch in batch_results:
+                all_rows.extend(batch)
         if not all_rows:
             logger.info("无新数据（可能非交易日）")
             return 0
@@ -402,6 +507,30 @@ class DataEngine:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         df = df.dropna(subset=["close"])
         df = df[df["volume"] > 0]
+
+        if self.enable_raw_prices:
+            # 第二轮：同窗口拉不复权收盘价（可执行价），失败仅告警，缺失行补 NULL
+            try:
+                if fetcher is not None:
+                    raw_rows = _bs_fetch_raw(tasks, fetcher=fetcher)
+                else:
+                    n_raw = min(4, len(tasks))
+                    raw_chunks = [tasks[i::n_raw] for i in range(n_raw)]
+                    with Pool(n_raw) as pool:
+                        raw_batches = pool.map(_bs_fetch_raw, raw_chunks)
+                    raw_rows = [r for b in raw_batches for r in b]
+                raw_map = {(r[0], r[1]): r[2] for r in raw_rows}
+                df["raw_close"] = [
+                    pd.to_numeric(raw_map.get((s, d)), errors="coerce")
+                    for s, d in zip(df["symbol"], df["date"])
+                ]
+                raw_hit = int(df["raw_close"].notna().sum())
+                logger.info(f"sync_today_bulk: 不复权价写入 {raw_hit}/{len(df)} 行")
+            except Exception as exc:  # noqa: BLE001 - 第一轮已落库成功，静默降级
+                logger.warning(f"不复权收盘价同步失败（已降级为纯后复权写入）：{exc}")
+                df["raw_close"] = pd.NA
+        else:
+            df["raw_close"] = pd.NA
 
         count = len(df)
         with _connect(self.db_path) as conn:
@@ -524,6 +653,96 @@ class DataEngine:
             preview = ", ".join(failed_symbols[:20])
             logger.warning(f"以下股票拉取失败（可重跑续传补齐）: {preview} ...")
 
+    def backfill_raw(self, symbols: list[str], n_workers: int = 8, fetcher=None) -> dict:
+        """老库补齐不复权收盘价（adjustflag=\"3\"，UPDATE 已有行，不新增行）。
+
+        可重跑/续传：已补齐（同 window 内 raw_close 全非空）的股票自动跳过；
+        失败股票上报 `failed`，下次重跑时继续尝试。
+
+        Args:
+            symbols: 待处理的股票代码列表（原样传入）。
+            n_workers: 进程数。
+            fetcher: 测试注入的抓取函数（单元测试无网络时使用），传入后
+                跳过 multiprocessing.Pool，走串行单线程路径。
+
+        Returns:
+            dict: {"updated": 更新行数, "skipped": 已齐跳过的股票数,
+                "failed": 失败股票代码列表}。
+        """
+        from datetime import date
+        from multiprocessing import Pool
+
+        today_str = date.today().strftime("%Y-%m-%d")
+        window_start = self.start_date
+
+        with _connect(self.db_path, timeout=60.0) as conn:
+            coverage = {
+                symbol: (n_total, n_raw)
+                for symbol, n_total, n_raw in conn.execute(
+                    "SELECT symbol, COUNT(*), SUM(raw_close IS NOT NULL) "
+                    "FROM stock_daily GROUP BY symbol"
+                ).fetchall()
+            }
+
+        tasks: list = []
+        skipped = 0
+        for symbol in symbols:
+            n_total, n_raw = coverage.get(symbol, (0, 0))
+            if n_total and n_total == (n_raw or 0):
+                skipped += 1
+                continue
+            tasks.append((symbol, self._to_baostock_code(symbol), window_start, today_str))
+
+        if not tasks:
+            logger.info(f"全部 {len(symbols)} 只股票的不复权价已齐，无需补拉")
+            return {"updated": 0, "skipped": skipped, "failed": []}
+
+        if fetcher is not None:
+            raw_rows = _bs_fetch_raw(tasks, fetcher=fetcher)
+            failed: list = []
+        else:
+            n_workers = max(1, min(n_workers, len(tasks)))
+            chunks = [tasks[i::n_workers] for i in range(n_workers)]
+            logger.info(
+                f"需补不复权价 {len(tasks)} 只（已齐跳过 {skipped}），"
+                f"启动 {n_workers} 进程并行拉取..."
+            )
+            with Pool(n_workers) as pool:
+                batches = pool.map(_bs_fetch_raw, chunks)
+            raw_rows = [r for b in batches for r in b]
+            failed = []
+
+        updated = self._update_raw_prices(raw_rows)
+        fetched = {r[0] for r in raw_rows}
+        failed = [t[0] for t in tasks if t[0] not in fetched]
+        logger.info(
+            f"不复权价补齐完成 — 更新 {updated} 行 | "
+            f"已齐跳过 {skipped} 只 | 失败 {len(failed)} 只"
+        )
+        if failed:
+            preview = ", ".join(failed[:20])
+            logger.warning(f"以下股票补拉失败（可重跑续传补齐）: {preview} ...")
+        return {"updated": updated, "skipped": skipped, "failed": failed}
+
+    def _update_raw_prices(self, raw_rows: list) -> int:
+        """把 [symbol, date, raw_close] 应用到 stock_daily（UPDATE 已有行），返回更新行数。"""
+        rows = []
+        for symbol, day, close in raw_rows:
+            try:
+                value = float(close)
+            except (TypeError, ValueError):
+                continue
+            rows.append((value, symbol, day))
+        if not rows:
+            return 0
+        with _connect(self.db_path, timeout=60.0) as conn:
+            cur = conn.executemany(
+                "UPDATE stock_daily SET raw_close = ? WHERE symbol = ? AND date = ?",
+                rows,
+            )
+            conn.commit()
+            return cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else len(rows)
+
     # ── 股票列表 ──
 
     def get_all_symbols(self) -> list[str]:
@@ -546,9 +765,10 @@ class DataEngine:
         return symbols
 
     def get_local_symbols(self) -> list[str]:
+        """返回本地库中已有 K 线的股票代码列表（按代码排序，保证离线可用）。"""
         with _connect(self.db_path) as conn:
             rows = conn.execute(
-                "SELECT DISTINCT symbol FROM stock_daily"
+                "SELECT DISTINCT symbol FROM stock_daily ORDER BY symbol"
             ).fetchall()
         return [row[0] for row in rows]
 

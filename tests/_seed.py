@@ -54,3 +54,16 @@ def insert_bars(db_path: str, symbol: str, rows: list[tuple]) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def set_raw_closes(db_path: str, symbol: str, closes: dict[str, float]) -> None:
+    """给已有行的 raw_close 列赋值（测试不复权价路径用）。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executemany(
+            "UPDATE stock_daily SET raw_close = ? WHERE symbol = ? AND date = ?",
+            [(v, symbol, d) for d, v in closes.items()],
+        )
+        conn.commit()
+    finally:
+        conn.close()

@@ -25,7 +25,11 @@ logger = get_logger(__name__)
 
 @dataclass
 class ExitSignal:
-    """一条卖出提醒信号。"""
+    """一条卖出提醒信号。
+
+    价格口径说明：``price_basis`` 为 ``"raw"`` 时现价/止损/盈亏均为不复权原始价
+    （可直接下单）；为 ``"hfq"`` 时是后复权价（仅表达相对关系，下单需换算）。
+    """
 
     symbol: str
     strategy: str
@@ -37,21 +41,24 @@ class ExitSignal:
     ret_pct: float
     reason: str  # 硬止损 / 跌破MA20 / 时间止损
     detail: str
+    price_basis: str = "hfq"  # "raw"（可下单）/ "hfq"（后复权降级表达）
 
     def render_plain(self) -> str:
         """控制台/日志用的单行文本。"""
+        basis = "" if self.price_basis == "raw" else "（后复权）"
         return (
             f"{self.symbol} [{self.strategy or '-'}] {self.reason} | "
             f"买 {self.buy_date} @{self.buy_price:.3f}×{self.qty}股 | "
-            f"现价 {self.current_price:.3f} ({self.ret_pct:+.1f}%) | {self.detail}"
+            f"现价 {self.current_price:.3f}{basis} ({self.ret_pct:+.1f}%) | {self.detail}"
         )
 
     def render_html(self) -> str:
         """Telegram HTML 用的多行文本。"""
+        basis = "" if self.price_basis == "raw" else "（后复权）"
         return (
             f"🔴 <b>{self.symbol}</b> {self.reason}\n"
             f"策略：{self.strategy or '-'}　持股：{self.buy_date} 起 {self.qty} 股\n"
-            f"买入 {self.buy_price:.3f} → 现价 {self.current_price:.3f}"
+            f"买入 {self.buy_price:.3f} → 现价 {self.current_price:.3f}{basis}"
             f"（{self.ret_pct:+.1f}%），止损价 {self.stop_price:.3f}\n"
             f"{self.detail}"
         )
@@ -217,7 +224,27 @@ class PositionManager:
                     continue
 
                 last = df.iloc[-1]
-                current = float(last["close"])
+                latest_date = str(last["date"])
+                close_hfq = float(last["close"])
+
+                # ── 价格口径切换（可执行价）──
+                # 登记的 buy_price/stop 都是原始成交价；库内 OHLC 是后复权。
+                # 同日 raw_close 存在 → 用 scale = raw/后复权 把后复权序列映射回
+                # 原始价坐标系再比较；缺失 → 降级后复权并打标 price_basis="hfq"。
+                basis = "hfq"
+                raw = self.engine.get_raw_close(symbol)
+                if (raw is not None and raw[0] == latest_date
+                        and raw[1] and raw[1] > 0 and close_hfq > 0):
+                    scale = float(raw[1]) / close_hfq
+                else:
+                    scale = 0.0
+                if scale > 0:
+                    basis = "raw"
+                    current = float(raw[1])
+                    low_min = float(since["low"].min()) * scale
+                else:
+                    current = close_hfq
+                    low_min = float(since["low"].min())
                 ret_pct = (current / buy_price - 1.0) * 100.0
                 held_bars = len(since)
 
@@ -225,18 +252,19 @@ class PositionManager:
                 detail = ""
 
                 # 1. 硬止损：买入以来盘中最低价触及止损线
-                low_min = float(since["low"].min())
                 if low_min <= stop:
                     reason = "硬止损"
-                    detail = f"期间最低 {low_min:.3f} ≤ 止损价 {stop:.3f}，应已离场"
+                    detail = f"期间最低 {low_min:.2f} ≤ 止损价 {stop:.2f}，应已离场"
 
                 # 2. 趋势离场：收盘跌破 20 日均线
                 # （detail 文案避免使用裸 "<" ">"，Telegram HTML 解析会报错）
                 if reason is None and len(df) >= 20:
                     ma20 = float(df["close"].rolling(20).mean().iloc[-1])
+                    if basis == "raw":
+                        ma20 *= scale
                     if current < ma20:
                         reason = "跌破MA20"
-                        detail = f"收盘 {current:.3f} 低于 MA20 {ma20:.3f}，趋势转弱"
+                        detail = f"收盘 {current:.2f} 低于 MA20 {ma20:.2f}，趋势转弱"
 
                 # 3. 时间止损：持有 N 个交易日仍不盈利
                 if reason is None and held_bars - 1 >= time_days and current <= buy_price:
@@ -256,6 +284,7 @@ class PositionManager:
                             ret_pct=ret_pct,
                             reason=reason,
                             detail=detail,
+                            price_basis=basis,
                         )
                     )
             except Exception as exc:  # noqa: BLE001 - 单只失败不阻断整体评估

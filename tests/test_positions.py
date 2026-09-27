@@ -8,7 +8,7 @@ from sequoia_x.core.config import Settings
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.portfolio import PositionManager
 
-from tests._seed import bar, flat_bars, insert_bars, weekdays_ending
+from tests._seed import bar, flat_bars, insert_bars, set_raw_closes, weekdays_ending
 
 AS_OF = "2026-09-25"
 DATES = weekdays_ending(AS_OF, 40)
@@ -102,6 +102,34 @@ def test_evaluate_priority_and_stale_skip(tmp_path):
 def test_evaluate_empty_when_no_positions(tmp_path):
     _, _, pm = _setup(tmp_path)
     assert pm.evaluate(as_of=AS_OF) == []
+
+
+def test_evaluate_prefers_raw_price_when_available(tmp_path):
+    """同日 raw_close 存在时：现价/盈亏用原始价并打标 raw，可直接下单。"""
+    engine, _, pm = _setup(tmp_path)
+    _seed_scenarios(engine)
+    # 600104 上涨无信号；补原始价后现价应为 raw（12.50）而非后复权收盘
+    set_raw_closes(engine.db_path, "600104", {DATES[-1]: 12.50})
+    pm.add("600104", buy_date=DATES[0], buy_price=10.0, qty=100)
+    # 构造时间止损：把买入价抬高到现价之上 → 持有 40 天 + 微亏 → 时间止损
+    pm.close("600104", close_price=10.0, reason="测试重置")
+    pm.add("600104", buy_date=DATES[0], buy_price=13.0, qty=100)
+    signals = pm.evaluate(as_of=AS_OF)
+    by_symbol = {s.symbol: s for s in signals}
+    assert by_symbol["600104"].price_basis == "raw"
+    assert by_symbol["600104"].current_price == pytest.approx(12.50, abs=1e-6)
+    assert "后复权" not in by_symbol["600104"].render_html()
+
+
+def test_evaluate_falls_back_to_hfq_without_raw(tmp_path):
+    """缺 raw_close 时降级后复权并打标 hfq，渲染带“（后复权）”提示。"""
+    engine, _, pm = _setup(tmp_path)
+    _seed_scenarios(engine)
+    pm.add("600101", buy_date=DATES[0], buy_price=10.0, qty=100)
+    signals = pm.evaluate(as_of=AS_OF)
+    by_symbol = {s.symbol: s for s in signals}
+    assert by_symbol["600101"].price_basis == "hfq"
+    assert "（后复权）" in by_symbol["600101"].render_html()
 
 
 def test_close_and_stats(tmp_path):

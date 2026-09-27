@@ -27,8 +27,12 @@ class Settings(BaseSettings):
     position_stop_loss: float = 0.07  # 硬止损：买入价 × (1 - 该比例)
     position_time_stop_days: int = 10  # 时间止损：持有 N 个交易日仍不盈利则提醒离场
 
+    # ── 原始价同步（见 sequoia_x/data/engine.py）──
+    enable_raw_prices: bool = True  # 日常增量/回填是否同步不复权收盘价（下单用）
+
     # ── 当日操作手册（见 sequoia_x/manual.py，落盘于 selections_dir 同级的 manuals 目录）──
     manual_take_profit: float = 0.20  # 止盈目标：信号日收盘 × (1 + 该比例)
+    manual_push_top_n: int = 10  # 手册 Telegram 摘要买卖各取前 N 条；0 = 不推送手册摘要
 
     # ── 运行归档 ──
     log_file: str = "log.txt"  # 日志落盘路径；空字符串表示只输出到控制台
