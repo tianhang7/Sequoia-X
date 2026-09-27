@@ -22,7 +22,7 @@ UTF-8 日志落盘、信号级回测（`--backtest`），测试套件基于 hypo
 
 ```bash
 python main.py                 # 日常模式：增量补数据 → 数据新鲜度断言 → 持仓卖出评估
-                               #           → 策略选股 + 过滤 → 归档 → Telegram 推送
+                               #           → 策略选股 + 过滤 → 归档 + 当日操作手册 → Telegram 推送
 python main.py --backfill      # 回填模式：8进程并行灌入全市场历史K线（可中断续传）
 python main.py --backtest      # 回测模式：验证策略历史信号质量（不推送任何消息）
 python main.py --position-list # 查看持仓与复盘统计
@@ -151,10 +151,16 @@ python main.py --position-exits             # 手动评估卖出条件（不推�
 推送卖出提醒（Telegram）。
 止损/时间参数：`POSITION_STOP_LOSS=0.07`、`POSITION_TIME_STOP_DAYS=10`。
 
-### 4. 每日选股归档与日志落盘
+### 4. 每日选股归档、操作手册与日志落盘
 
 - 选股结果写入 `data/selections/selections_YYYYMMDD.json`
   （含 `as_of` 数据日期、原始/过滤后数量、剔除统计、股票清单）；
+- **当日操作手册**落盘 `data/manuals/manual_YYYYMMDD.md`：把持仓离场信号整理成
+  「建议卖出」（现价 / 目标卖出价 / 止损价 / 离场原因），把过滤后的策略候选整理成
+  「建议买入」（收盘价参考 / 建议限价 / 止损价 / 止盈目标，跨策略命中自动去重），
+  末尾附一页式执行清单，次日按图操作即可；同日重跑覆盖旧文件，无信号时也留档；
+  止盈比例 `MANUAL_TAKE_PROFIT=0.20`（止损沿用 `POSITION_STOP_LOSS`）；
+  注意库内价格为后复权口径，表中价格用于表达相对比例，下单以行情软件实时价为准；
 - 运行日志同步写入 `LOG_FILE`（默认 `log.txt`，UTF-8；置空则仅控制台）。
 
 ### 5. 历史回测（验证策略信号质量）
@@ -187,6 +193,7 @@ Sequoia-X/
 │   ├── sequoia_v2.db            # 行情/名称缓存/持仓/键值表
 │   ├── trade_calendar.json      # 交易日历缓存
 │   ├── selections/              # 每日选股归档 selections_YYYYMMDD.json
+│   ├── manuals/                 # 当日操作手册 manual_YYYYMMDD.md
 │   └── backtest/                # 回测报告 JSON
 ├── sequoia_x/
 │   ├── core/
@@ -206,6 +213,7 @@ Sequoia-X/
 │   │   ├── rps_breakout.py      # RPS 突破策略
 │   │   └── private_placement.py # 定增公告策略（事件型，不参与回测）
 │   ├── portfolio.py             # 持仓管理：登记/平仓/卖出条件评估
+│   ├── manual.py                # 当日操作手册：建议买卖 + 目标价（Markdown 落盘）
 │   ├── backtest/
 │   │   └── engine.py            # 信号级回测引擎（次日开盘进场 + 规则离场）
 │   └── notify/

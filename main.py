@@ -2,7 +2,7 @@
 
 运行模式：
   python main.py                  # 日常模式：增量补数据 → 数据新鲜度断言 → 持仓卖出评估
-                                  #           → 策略选股 + 过滤 → 归档 → Telegram 推送
+                                  #           → 策略选股 + 过滤 → 归档 + 当日操作手册 → Telegram 推送
   python main.py --backfill       # 回填模式：baostock 拉全市场历史K线（首次/补数据用，约12分钟）
   python main.py --backtest       # 回测模式：验证策略历史信号质量（不推送任何消息）
   python main.py --position-list  # 查看持仓与复盘统计
@@ -27,6 +27,7 @@ from sequoia_x.core.config import Settings, get_settings
 from sequoia_x.core.logger import configure_file_logging, get_logger
 from sequoia_x.core.trading_calendar import TradingCalendar
 from sequoia_x.data.engine import DataEngine
+from sequoia_x.manual import generate_manual
 from sequoia_x.notify.telegram import TelegramNotifier
 from sequoia_x.portfolio import PositionManager
 from sequoia_x.strategy.base import BaseStrategy
@@ -251,6 +252,20 @@ def main() -> None:
 
         # 7. 归档当日选股结果（JSON，可复盘/喂给后续工具）
         _archive_selections(settings, as_of, latest_iso, selections)
+
+        # 8. 生成当日操作手册（建议买入/卖出 + 目标价，Markdown 落盘，失败不阻断主流程）
+        try:
+            manual_path = generate_manual(
+                settings,
+                engine,
+                as_of=as_of,
+                latest_iso=latest_iso,
+                exit_signals=exit_signals,
+                selections=selections,
+            )
+            logger.info(f"当日操作手册：{manual_path}")
+        except Exception as manual_exc:  # noqa: BLE001 - 辅助产物，失败仅告警
+            logger.warning(f"操作手册生成失败（不影响主流程）：{manual_exc}")
 
     except Exception:
         try:
