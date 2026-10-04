@@ -18,7 +18,7 @@ UTF-8 日志落盘、信号级回测（`--backtest`），测试套件基于 hypo
 
 ---
 
-## 五种运行模式
+## 运行模式 | Usage
 
 ```bash
 python main.py                 # 日常模式：增量补数据 → 数据新鲜度断言 → 持仓卖出评估
@@ -28,7 +28,11 @@ python main.py --backfill-raw  # 补拉模式：仅补不复权收盘价 raw_clo
 python main.py --backtest      # 回测模式：验证策略历史信号质量（不推送任何消息）
 python main.py --position-list # 查看持仓与复盘统计
 python main.py --position-exits# 仅评估持仓卖出条件（不推送）
+python main.py --position-add 600519 --position-qty 100 --position-price 1500   # 登记买入
+python main.py --position-close 600519 --close-price 1600                       # 登记平仓
 ```
+
+完整参数见 `python main.py --help`。
 
 ---
 
@@ -56,13 +60,38 @@ python main.py --position-exits# 仅评估持仓卖出条件（不推送）
 
 ### 1. 安装依赖
 
-```bash
-# 推荐使用 uv（快速包管理器）
-uv sync
+推荐使用 [uv](https://docs.astral.sh/uv/)（快速包管理器，本仓库已提交 `uv.lock`）：
 
-# 或者 pip
+```bash
+uv sync
+```
+
+或者 pip：
+
+```bash
 pip install .
 ```
+
+> **Windows 激活虚拟环境报「无法加载文件…未数字签名」？**
+> 这是 PowerShell 执行策略拦截了 `.venv\Scripts\activate.ps1`。任选其一：
+>
+> ```powershell
+> # A. 对当前用户永久放开（推荐，不影响系统全局）
+> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+> .venv\Scripts\activate
+>
+> # B. 仅本次会话临时放开
+> Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+> .venv\Scripts\activate
+> ```
+>
+> ```cmd
+> :: C. 彻底绕过 PowerShell：改用 CMD（不受执行策略影响）
+> .venv\Scripts\activate.bat
+> ```
+>
+> VS Code 中可将「终端默认配置」设为 Command Prompt，避免该问题。
+> 也可以完全跳过激活，直接用 `.venv\Scripts\python.exe main.py`。
 
 ### 2. 配置环境变量
 
@@ -113,8 +142,11 @@ schtasks /Create /TN "SequoiaX-Daily" /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 19:1
 ### 5. 运行测试
 
 ```bash
-python -m pytest tests -q          # 51 项属性测试 + 单元测试
+python -m pytest tests -q          # 67 项测试：hypothesis 属性测试 + 单元测试
 ```
+
+测试覆盖数据引擎、配置、日志、过滤器、策略信号、持仓、手册、回测、Telegram 与交易日历；
+全部使用 fixture / mock，不访问网络或真实数据库。
 
 ---
 
@@ -198,6 +230,8 @@ python main.py --backtest --bt-days 250 --bt-step 20 \
 Sequoia-X/
 ├── main.py                      # 入口：argparse 分发日常/回填/回测/持仓模式
 ├── pyproject.toml               # 依赖声明 + ruff/pytest 配置
+├── uv.lock                      # uv 锁定的依赖版本（推荐用 uv sync 安装）
+├── log.txt                      # 运行日志（LOG_FILE 默认值，不入 git）
 ├── .env.example                 # 环境变量模板
 ├── data/                        # SQLite 数据库 + 交易日历 + 归档（运行时生成，不入 git）
 │   ├── sequoia_v2.db            # 行情/名称缓存/持仓/键值表

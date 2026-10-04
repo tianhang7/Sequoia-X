@@ -29,7 +29,16 @@ build/
 
 # 测试与工具缓存
 .pytest_cache/
+.pytest-of-*/
+pytest-of-*/
 .ruff_cache/
+.mypy_cache/
+
+# 编辑器/系统杂项
+Thumbs.db
+Desktop.ini
+*.tmp
+*.bak
 
 # 日志
 *.log
