@@ -12,6 +12,8 @@ Sequoia-X V2 是面向 A 股市场的量化选股系统，基于现代 Python �
 
 数据层使用 [baostock](http://baostock.com)（免费、无需注册、无限流）拉取历史及增量日 K 数据（后复权），
 存储于本地 SQLite，彻底规避东方财富反爬问题；交易日历来自新浪（本地缓存 + 断网降级）。
+baostock 宕机/登录失败时，可一键切换 [Yahoo Finance](https://finance.yahoo.com) 备用数据源补齐数据
+（`--yahoo`，见下文「数据源降级」）。
 
 工程保障：数据过期拒绝推送、六道选股过滤器、持仓卖出提醒、每日选股 JSON 归档、
 UTF-8 日志落盘、信号级回测（`--backtest`），测试套件基于 hypothesis 属性测试 + 单元测试。
@@ -25,6 +27,8 @@ python main.py                 # 日常模式：增量补数据 → 数据新鲜
                                #           → 策略选股 + 过滤 → 归档 + 当日操作手册 → Telegram 推送
 python main.py --backfill      # 回填模式：8进程并行灌入全市场历史K线（可中断续传）
 python main.py --backfill-raw  # 补拉模式：仅补不复权收盘价 raw_close（老库升级/缺口续传用）
+python main.py --backfill --yahoo      # 备用数据源：用 Yahoo Finance 回填历史K线（baostock 不可用时）
+python main.py --backfill-raw --yahoo  # 备用数据源：用 Yahoo Finance 补齐 raw_close
 python main.py --backtest      # 回测模式：验证策略历史信号质量（不推送任何消息）
 python main.py --position-list # 查看持仓与复盘统计
 python main.py --position-exits# 仅评估持仓卖出条件（不推送）
@@ -118,7 +122,39 @@ python main.py --backfill
 python main.py --backfill-raw
 ```
 
-### 4. 日常运行
+### 4. 数据源降级：改用 Yahoo Finance 补齐数据
+
+baostock 偶发登录失败或返回空数据时（日志出现「失败 NNNN 只」「更新 0 行」），
+可用 Yahoo Finance 作为备用数据源补齐，无需改代码：
+
+```bash
+python main.py --backfill-raw --yahoo   # 补齐不复权收盘价 raw_close（只 UPDATE 已有行）
+python main.py --backfill --yahoo       # 补齐/回填后复权历史K线（INSERT OR IGNORE，可续传）
+```
+
+两个模式都可反复重跑：已补齐的股票自动跳过，只处理仍缺数据的部分；
+失败清单会写入日志（`以下股票 Yahoo 亦无数据: ...`），修复后重跑继续。
+
+实现要点（`sequoia_x/data/yahoo_source.py` + `DataEngine.backfill_*_yahoo`）：
+
+| 项目 | 说明 |
+|---|---|
+| 代码映射 | `6/9` 开头 → `.SS`（上交所），`0/2/3` → `.SZ`（深交所），`4/8` → `.BJ`（北交所） |
+| 复权口径 | `auto_adjust=True` → 后复权（写 `close`）；`False` → 不复权（写 `raw_close`），与 baostock `adjustflag` 1/3 一致 |
+| 断点续传 | 历史回填按各股票本地 `MAX(date)+1` 起步；raw 补齐按「最早缺 `raw_close` 的那一行」起步，不重拉整段历史 |
+| 并发/限流 | 每批 50 只、线程并发下载；单批失败只记日志，不影响其余批次 |
+| 缓存 | yfinance 缓存落在 `data/yf_cache/`，规避 Windows 默认缓存目录不可写导致的报错 |
+
+> ⚠️ **成交额口径差异**：Yahoo 不提供成交额字段，`turnover` 以 `close × volume` 近似，
+> 仅供流动性过滤器（`FILTER_MIN_AVG_AMOUNT`）做量级粗筛，不参与任何价格计算与下单。
+>
+> ⚠️ 代码表来自本地库（`get_local_symbols`），故 Yahoo 通道解决的是「数据缺口」而非「冷启动」：
+> 全新库仍需先用 baostock 执行一次 `--backfill` 建立代码与名称缓存。
+>
+> ℹ️ 日志中的「**已最新 N 只**」表示这些股票的本地数据已追平最近交易日、窗口内无新增交易日
+> （如国庆休市等），属正常完成；只有「**失败**」清单才代表 Yahoo 确实拉不到数据，需要重跑补齐。
+
+### 5. 日常运行
 
 ```bash
 python main.py
@@ -139,7 +175,7 @@ schtasks /Create /TN "SequoiaX-Daily" /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 19:1
 
 数据落后最新交易日时（`strict` 模式）任务会推送告警并以退出码 1 终止，不会发出过期信号。
 
-### 5. 运行测试
+### 6. 运行测试
 
 ```bash
 python -m pytest tests -q          # 67 项测试：hypothesis 属性测试 + 单元测试
@@ -220,7 +256,49 @@ python main.py --backtest --bt-days 250 --bt-step 20 \
 - 输出各策略笔数/胜率/平均/中位/离场分布 + 全市场等权基准，
   JSON 报告落盘 `data/backtest/`；事件型策略（定增）不参与回测；
 - 耗时参考：全市场内存加载约 1 分钟，之后每个信号日 × 每策略约 30~60 秒，
-  默认参数约需 5~15 分钟。策略均已支持 `as_of` 历史切片，无前视偏差。
+  默认参数约需 5~15 分钟（`--bt-days 250 --bt-step 20` 实测约 15 分钟）。策略均已支持 `as_of` 历史切片，无前视偏差。
+
+#### 回测实测结论（重要，务必先读）
+
+用 `--bt-days 250 --bt-step 20`（2025-09-18 ~ 2026-09-16，13 个信号日，基准 **-0.59%**）实测：
+
+| 策略 | 笔数 | 胜率 | 均笔 | 盈利因子 | 保本胜率 | 总收益 |
+|---|---|---|---|---|---|---|
+| **RpsBreakout** | 662 | 27.2% | **+1.39%** | 1.30 | 22.3% | **+922%** |
+| **TurtleTrade** | 560 | 24.5% | +0.17% | 1.04 | 23.7% | +97% |
+| UptrendLimitDown | 12 | 41.7% | +6.00% | 3.83 | 15.7% | +72% |
+| HighTightFlag | 13 | 38.5% | +0.80% | 1.45 | 30.1% | +10% |
+| LimitUpShakeout | 9 | 22.2% | -2.78% | 0.51 | 35.9% | -25% |
+| **MaVolume** | 98 | 16.3% | -1.90% | 0.49 | 28.4% | **-186%** |
+
+**结论一：短窗口回测会严重误导。** 同一套策略在 2.5 个月窗口（基准 +3.88%）下 TurtleTrade 是
+-472%、RPS 是 -285%；换一年窗口（基准 -0.59%）后分别变成 +97% 和 +922%。「跑输基准」很大程度上
+是踩在了一个大盘上涨的短窗口上。**判断策略至少要用一年以上窗口。**
+
+**结论二：日线信号上的固定 10 日时间止损过早。** 按持仓天数分组，两个窗口的规律高度一致：
+
+| 持仓 | Turtle 胜率 | 均笔 | RPS 胜率 | 均笔 |
+|---|---|---|---|---|
+| 1-2 天 | **0.0%** | -7.34% | 2.7% | -6.82% |
+| 3-5 天 | **0.0%** | -6.64% | 2.9% | -6.72% |
+| 6-10 天 | 7.5% | -4.56% | 18.1% | -3.86% |
+| 11-20 天 | 40.0% | +0.89% | 58.7% | +2.91% |
+| 21+ 天 | **96.9%** | **+30.53%** | **97.6%** | **+41.01%** |
+
+5 天内止损的 176 笔 Turtle 信号胜率**是 0%**；仅保留持仓 ≥11 天的交易，RPS 胜率升至 74%、
+合计 +3715%，MaVolume 更是从 -186% 转为 +140%。**建议把 `POSITION_TIME_STOP_DAYS` 从 10 放宽到
+15~20 天，或改用移动止损（跌破 MA10 离场）后重新回测对照。**
+
+**结论三：警惕异常值依赖。** TurtleTrade 的 +97% 完全由单笔撑起——
+`603115`（2026-02-26 以 36.78 买入，持有 69 天至 124.08，**+237%**）；剔除这一笔后变为 **-139.7%**。
+UptrendLimitDown（+72% → 剔除后 +9.1%）同样如此。RPS 相对稳健（剔除后仍 +685%）。
+**优先实盘验证 RpsBreakout。**
+
+> ⚠️ **读数须知**
+> - 「总收益」是等额资金下各笔收益**直接相加**，**不是净值曲线**，未考虑仓位重叠与资金占用；
+> - 13 个信号日样本仍偏少，多笔交易来自同一信号日，**样本独立性弱**；
+> - 「持仓 ≥11 天」是事后视角（只有看到结果才知道持有了多久），不能直接当作交易规则，
+>   需改用移动止损等可实时判断的条件后再验证。
 
 ---
 
@@ -238,14 +316,16 @@ Sequoia-X/
 │   ├── trade_calendar.json      # 交易日历缓存
 │   ├── selections/              # 每日选股归档 selections_YYYYMMDD.json
 │   ├── manuals/                 # 当日操作手册 manual_YYYYMMDD.md
-│   └── backtest/                # 回测报告 JSON
+│   ├── backtest/                # 回测报告 JSON
+│   └── yf_cache/                # yfinance 缓存（--yahoo 备用通道使用）
 ├── sequoia_x/
 │   ├── core/
 │   │   ├── config.py            # Pydantic-settings 配置管理
 │   │   ├── logger.py            # rich 结构化日志 + 文件落盘
 │   │   └── trading_calendar.py  # 交易日历（新鲜度断言/回测取样）
 │   ├── data/
-│   │   └── engine.py            # 数据引擎（baostock 回填 + 增量同步 + SQLite）
+│   │   ├── engine.py            # 数据引擎（baostock 回填 + 增量同步 + Yahoo 降级 + SQLite）
+│   │   └── yahoo_source.py      # Yahoo Finance 备用数据源（代码映射/批量下载/口径对齐）
 │   ├── strategy/
 │   │   ├── base.py              # 策略抽象基类（支持 as_of 历史切片）
 │   │   ├── filters.py           # 选股结果过滤器（ST/停牌/次新/流动性/涨停…）
@@ -269,9 +349,14 @@ Sequoia-X/
 
 ## 数据说明
 
-- **数据源**：[baostock](http://baostock.com)（免费、无需注册、无限流）；定增事件与交易日历来自 akshare/新浪
+- **数据源**：[baostock](http://baostock.com)（免费、无需注册、无限流）为主；
+  [Yahoo Finance](https://finance.yahoo.com)（`--yahoo`）为降级备用通道；
+  定增事件与交易日历来自 akshare/新浪
 - **复权方式**：后复权（hfq）— 历史价格不变，适合增量存储，避免除权导致数据错乱；
   另存不复权收盘价 `raw_close` 专供下单/展示（持仓提醒、手册目标价均优先用它）
+- **两源口径对齐**：Yahoo 通道 `auto_adjust` 开/关分别对应 baostock 的
+  `adjustflag="1"`（后复权）与 `"3"`（不复权）；两者写入同一张 `stock_daily` 表，
+  可混用续传（`INSERT OR IGNORE` / `UPDATE`，已存在的行不会被重复拉取覆盖）
 - **存储**：本地 SQLite（`data/sequoia_v2.db`），可直接拷贝到其他机器使用
   - `stock_daily` 行情主表、`stock_name` 名称缓存（ST 判定）、
     `position` 持仓与复盘、`meta` 键值（新鲜度告警标记等）

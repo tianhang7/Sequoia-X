@@ -4,6 +4,8 @@
   python main.py                  # 日常模式：增量补数据 → 数据新鲜度断言 → 持仓卖出评估
                                   #           → 策略选股 + 过滤 → 归档 + 当日操作手册 → Telegram 推送
   python main.py --backfill       # 回填模式：baostock 拉全市场历史K线（首次/补数据用，约12分钟）
+  python main.py --backfill --yahoo       # 降级通道：Yahoo Finance 回填历史K线（baostock 不可用时）
+  python main.py --backfill-raw --yahoo   # 降级通道：Yahoo Finance 补齐 raw_close
   python main.py --backtest       # 回测模式：验证策略历史信号质量（不推送任何消息）
   python main.py --position-list  # 查看持仓与复盘统计
   python main.py --position-add 600519 --position-qty 100 --position-price 1500
@@ -91,6 +93,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="补拉模式：仅补齐 stock_daily 的不复权收盘价 raw_close（可重跑续传）",
     )
 
+    parser.add_argument(
+        "--yahoo",
+        action="store_true",
+        help="改用 Yahoo Finance 作为数据源（baostock 不可用时的备用通道），配合 --backfill / --backfill-raw",
+    )
+
     # ── 回测模式 ──
     parser.add_argument("--backtest", action="store_true", help="回测模式：验证策略历史信号质量（不推送）")
     parser.add_argument("--bt-start", dest="bt_start", default=None, help="回测起始日 YYYY-MM-DD（默认 end 前 N 个交易日）")
@@ -143,6 +151,15 @@ def main() -> None:
         if args.backfill:
             # ── 回填模式：单线程保守拉历史 K 线，自动多轮重跑 ──
             logger.info("进入回填模式...")
+            if args.yahoo:
+                # Yahoo 通道：代码列表取自本地库（冷启动时先有 baostock 建库）
+                symbols = engine.get_local_symbols() or engine.get_all_symbols()
+                res = engine.backfill_history_yahoo(symbols)
+                logger.info(
+                    f"回填完成：写入 {res['updated']} 行 / 跳过 {res['skipped']} 只 / 失败 {len(res['failed'])} 只"
+                )
+                logger.info("Sequoia-X V2 回填模式运行完成")
+                return
             all_symbols = engine.get_all_symbols()
             engine.backfill(all_symbols)
             logger.info("Sequoia-X V2 回填模式运行完成")
@@ -155,12 +172,19 @@ def main() -> None:
             if not local_symbols:
                 logger.error("本地库无K线数据，请先执行 python main.py --backfill 完成首次回填")
                 raise SystemExit(1)
-            result = engine.backfill_raw(local_symbols)
+            result = (
+                engine.backfill_raw_yahoo(local_symbols)
+                if args.yahoo
+                else engine.backfill_raw(local_symbols)
+            )
             logger.info(
                 f"补拉完成：更新 {result['updated']} 行 / "
                 f"已齐跳过 {result['skipped']} 只 / 失败 {len(result['failed'])} 只"
             )
             return
+
+        if args.yahoo and not (args.backfill or args.backfill_raw):
+            raise SystemExit("--yahoo 需与 --backfill 或 --backfill-raw 一起使用")
 
         # ── 持仓管理子命令（不同步数据、不跑策略、不推送）──
         if args.position_list or args.position_exits or args.position_add or args.position_close:

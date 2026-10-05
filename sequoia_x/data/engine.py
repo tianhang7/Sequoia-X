@@ -724,6 +724,150 @@ class DataEngine:
             logger.warning(f"以下股票补拉失败（可重跑续传补齐）: {preview} ...")
         return {"updated": updated, "skipped": skipped, "failed": failed}
 
+    def backfill_raw_yahoo(self, symbols: list[str]) -> dict:
+        """用 Yahoo Finance 补齐不复权收盘价（UPDATE 已有行，不新增行）。
+
+        作为 ``backfill_raw`` 的降级通道：当 baostock 登录失败/返回空时，
+        用 Yahoo 同一口径（不复权 close）补 raw_close。已是后复权列的 close 不动。
+        """
+        from datetime import date
+
+        from sequoia_x.data.yahoo_source import fetch_daily
+
+        today_str = date.today().strftime("%Y-%m-%d")
+
+        # 每只股票从「最早缺 raw_close 的那一行」起算，避免整段历史重拉
+        with _connect(self.db_path, timeout=60.0) as conn:
+            starts = {
+                symbol: first_missing
+                for symbol, first_missing in conn.execute(
+                    "SELECT symbol, MIN(date) FROM stock_daily "
+                    "WHERE raw_close IS NULL GROUP BY symbol"
+                ).fetchall()
+            }
+
+        tasks: list[tuple[str, str]] = []
+        skipped = 0
+        for symbol in symbols:
+            start = starts.get(symbol)
+            if not start:  # 无缺口（或库里根本没有该代码）
+                skipped += 1
+                continue
+            tasks.append((symbol, max(start, self.start_date)))
+
+        if not tasks:
+            logger.info(f"全部 {len(symbols)} 只股票的不复权价已齐，无需 Yahoo 补拉")
+            return {"updated": 0, "skipped": skipped, "failed": []}
+
+        fetch_from = min(s for _, s in tasks)
+        logger.info(
+            f"需补不复权价 {len(tasks)} 只（已齐跳过 {skipped}），"
+            f"改用 Yahoo Finance（{fetch_from} 起）..."
+        )
+        fetched = fetch_daily([s for s, _ in tasks], fetch_from, today_str, adjust=False)
+
+        by_symbol = dict(tasks)
+        raw_rows = []
+        for symbol, rows in fetched:
+            start = by_symbol[symbol]
+            # 行格式：[ticker, date, open, high, low, close, volume, turnover]
+            raw_rows.extend([symbol, r[1], r[5]] for r in rows if r[1] >= start)
+
+        updated = self._update_raw_prices(raw_rows)
+        hit = {s for s, _ in fetched}
+        failed = [s for s, _ in tasks if s not in hit]
+        logger.info(
+            f"Yahoo 补齐完成 — 更新 {updated} 行 | "
+            f"已齐跳过 {skipped} 只 | 失败 {len(failed)} 只"
+        )
+        if failed:
+            logger.warning(f"以下股票 Yahoo 亦无数据: {', '.join(failed[:20])} ...")
+        return {"updated": updated, "skipped": skipped, "failed": failed}
+
+    def backfill_history_yahoo(self, symbols: list[str]) -> dict:
+        """用 Yahoo Finance 回填后复权日线（INSERT OR IGNORE，可重跑续传）。
+
+        供 baostock 整体不可用时冷启动/续传使用；写入列与 ``backfill`` 完全一致。
+        """
+        from datetime import date, timedelta
+
+        from sequoia_x.data.yahoo_source import fetch_daily
+
+        today_str = date.today().strftime("%Y-%m-%d")
+
+        with _connect(self.db_path, timeout=60.0) as conn:
+            last_dates = dict(
+                conn.execute("SELECT symbol, MAX(date) FROM stock_daily GROUP BY symbol").fetchall()
+            )
+
+        targets: list[tuple[str, str]] = []
+        skipped = 0
+        for symbol in symbols:
+            last = last_dates.get(symbol)
+            if last and last >= today_str:
+                skipped += 1
+                continue
+            start = self.start_date if not last else (
+                date.fromisoformat(last) + timedelta(days=1)
+            ).strftime("%Y-%m-%d")
+            targets.append((symbol, start))
+
+        if not targets:
+            logger.info(f"全部 {len(symbols)} 只股票已是最新，无需 Yahoo 回填")
+            return {"updated": 0, "skipped": skipped, "failed": []}
+
+        by_symbol = dict(targets)
+        # 统一下载窗口取各股票起点的最小值，再按股票各自的起点过滤入库
+        fetch_from = min(s for _, s in targets)
+        logger.info(f"Yahoo 回填 {len(targets)} 只（已是最新跳过 {skipped}）...")
+        fetched = fetch_daily([s for s, _ in targets], fetch_from, today_str, adjust=True)
+
+        insert_cols = ["symbol", "date", "open", "high", "low", "close", "volume", "turnover"]
+        total = 0
+        written: set[str] = set()
+        # 命中 ticker 但窗口内无新交易日：本地已追平最新交易日，属正常完成而非失败
+        up_to_date: set[str] = set()
+        with _connect(self.db_path, timeout=60.0) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=60000")
+            for symbol, rows in fetched:
+                start = by_symbol[symbol]
+                df = pd.DataFrame(
+                    # 行格式：[ticker, date, open, high, low, close, volume, turnover]
+                    [[symbol] + r[1:8] for r in rows if r[1] >= start],
+                    columns=insert_cols,
+                )
+                for col in ["open", "high", "low", "close", "volume", "turnover"]:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+                df = df.dropna(subset=["close"])
+                df = df[df["volume"] > 0]
+                if df.empty:
+                    up_to_date.add(symbol)
+                    continue
+                conn.executemany(
+                    "INSERT OR IGNORE INTO stock_daily "
+                    "(symbol, date, open, high, low, close, volume, turnover) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    df[insert_cols].astype(object).itertuples(index=False, name=None),
+                )
+                conn.commit()
+                total += len(df)
+                written.add(symbol)
+
+        done = written | up_to_date
+        failed = [s for s, _ in targets if s not in done]
+        logger.info(
+            f"Yahoo 回填完成 — 写入 {total} 行 | 已最新 {len(up_to_date)} 只 | "
+            f"跳过 {skipped} 只 | 失败 {len(failed)} 只"
+        )
+        if failed:
+            logger.warning(f"以下股票 Yahoo 亦无数据: {', '.join(failed[:20])} ...")
+        return {
+            "updated": total,
+            "skipped": skipped + len(up_to_date),
+            "failed": failed,
+        }
+
     def _update_raw_prices(self, raw_rows: list) -> int:
         """把 [symbol, date, raw_close] 应用到 stock_daily（UPDATE 已有行），返回更新行数。"""
         rows = []
