@@ -157,8 +157,9 @@ class _MemoryEngine:
                 if df.empty:
                     continue
             df = df.drop(columns=["symbol"], errors="ignore")
-            # 预计算 MA20，供离场模拟使用
+            # 预计算均线，供离场模拟使用（MA20 固定，MA10 供移动止损）
             df["ma20"] = df["close"].rolling(20).mean()
+            df["ma10"] = df["close"].rolling(10).mean()
             self._frames[symbol] = df
         logger.info(f"回测行情缓存完成：{len(self._frames)} 只股票（cutoff={self._cutoff}）")
         return len(self._frames)
@@ -194,6 +195,8 @@ class Backtester:
         fee_rate: float = 0.001,
         stop_loss: float | None = None,
         time_stop_days: int | None = None,
+        trail_ma: int | None = None,
+        trail_activate: float | None = None,
     ) -> None:
         """
         Args:
@@ -203,6 +206,11 @@ class Backtester:
             fee_rate: 往返费用率（从单笔收益中扣除）。
             stop_loss: 硬止损比例，默认取 settings.position_stop_loss。
             time_stop_days: 时间止损天数，默认取 settings.position_time_stop_days。
+            trail_ma: 移动止损均线周期（如 10 = 收盘跌破 MA10 离场）。
+                为 None 时沿用固定 MA20 离场。移动止损启用时仍保留硬止损。
+            trail_activate: 移动止损启用所需的最低浮盈比例（如 0.05 =
+                浮盈超 5% 后才启用 MA10 离场，避免刚建仓就被均线扫出）。
+                None 时取 0.0（即从第一根K线起就启用）。
         """
         self.settings = settings
         self.engine = engine
@@ -218,6 +226,8 @@ class Backtester:
         self.time_days = (
             time_stop_days if time_stop_days is not None else settings.position_time_stop_days
         )
+        self.trail_ma = trail_ma
+        self.trail_activate = trail_activate if trail_activate is not None else 0.0
         self.benchmark_pct: float = 0.0
         self.signal_dates: list[str] = []
 
@@ -347,6 +357,12 @@ class Backtester:
         closes = df["close"]
         lows = df["low"]
         ma20s = df["ma20"]
+        # 移动止损模式：收盘跌破 MA_N 离场（仍保留硬止损兜底）
+        trail_col = None
+        if self.trail_ma:
+            col = f"ma{self.trail_ma}"
+            if col in df.columns:
+                trail_col = df[col]
 
         pending_reason: str | None = None  # 收盘触发 → 次日开盘执行
 
@@ -373,14 +389,22 @@ class Backtester:
                     dates[j], fill, j - i, "硬止损",
                 )
 
-            # 3) 收盘跌破 MA20 → 次日开盘卖出
-            ma_j = ma20s.iloc[j]
+            # 3) 离场判定（优先级：移动止损 > 固定 MA20 > 时间止损）
             held = j - i
-            if pd.notna(ma_j) and close_j < float(ma_j):
-                pending_reason = "跌破MA20"
-            # 4) 时间止损：持有 N 个交易日仍不盈利 → 次日开盘卖出
-            elif held >= self.time_days and close_j <= entry_price:
-                pending_reason = "时间止损"
+            if trail_col is not None:
+                # 浮盈达标后才启用，避免刚建仓就被均线扫出
+                armed = (close_j / entry_price - 1.0) >= self.trail_activate
+                ma_t = trail_col.iloc[j]
+                if armed and pd.notna(ma_t) and close_j < float(ma_t):
+                    pending_reason = f"跌破MA{self.trail_ma}"
+                # 移动止损模式下不设时间止损：让赢家自己走
+            else:
+                ma_j = ma20s.iloc[j]
+                if pd.notna(ma_j) and close_j < float(ma_j):
+                    pending_reason = "跌破MA20"
+                # 4) 时间止损：持有 N 个交易日仍不盈利 → 次日开盘卖出
+                elif held >= self.time_days and close_j <= entry_price:
+                    pending_reason = "时间止损"
 
         # 窗口结束：按最后收盘价强平（保留最后的 pending 原因）
         j = len(df) - 1

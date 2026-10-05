@@ -11,7 +11,7 @@ from sequoia_x.core.config import Settings
 from sequoia_x.data.engine import DataEngine
 from sequoia_x.strategy.ma_volume import MaVolumeStrategy
 from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
-from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
+from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
 
 from tests._seed import bar, flat_bars, insert_bars, weekdays_ending
 
@@ -56,7 +56,8 @@ def test_backtest_integration(tmp_path):
 
     strategies = [
         MaVolumeStrategy(engine=engine, settings=settings),
-        TurtleTradeStrategy(engine=engine, settings=settings),
+        # TurtleTradeStrategy 已下线，改用在役的 RpsBreakoutStrategy
+        RpsBreakoutStrategy(engine=engine, settings=settings),
         # 事件型策略必须被自动剔除（不参与回测）
         PrivatePlacementStrategy(engine=engine, settings=settings),
     ]
@@ -64,7 +65,7 @@ def test_backtest_integration(tmp_path):
                     days=120, step=40)
     reports = bt.run()
 
-    assert set(reports) == {"MaVolumeStrategy", "TurtleTradeStrategy"}
+    assert set(reports) == {"MaVolumeStrategy", "RpsBreakoutStrategy"}
     assert "PrivatePlacementStrategy" not in reports
     assert len(bt.signal_dates) >= 2
     assert isinstance(bt.benchmark_pct, float)

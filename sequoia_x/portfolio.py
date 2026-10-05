@@ -4,8 +4,11 @@
 
   1. **登记买入**（CLI：``python main.py --position-add 600519 --qty 100 --price 1500``），
      登记时写死止损价（缺省 = 买入价 × (1 - position_stop_loss)）。
-  2. **每日评估**：收盘后按优先级「硬止损 > 跌破MA20 > 时间止损」检查全部持仓，
-     产出 :class:`ExitSignal` 清单，由 main.py 推送卖出提醒。
+  2. **每日评估**：收盘后检查全部持仓并产出 :class:`ExitSignal` 清单，由 main.py 推送卖出提醒。
+     离场优先级随配置切换：
+     - ``POSITION_TRAIL_MA > 0``（默认）：「硬止损 > 浮盈达阈值后收盘跌破 MA_N」，
+       **停用时间止损**（回测实测：日线信号 11 天前几乎不兑现，时间止损过早砍掉赢家）；
+     - ``POSITION_TRAIL_MA = 0``（回退）：「硬止损 > 跌破 MA20 > 时间止损」。
 
 离场由人工执行，之后用 ``--position-close`` 登记平仓结果，纳入复盘统计。
 """
@@ -39,7 +42,7 @@ class ExitSignal:
     stop_price: float
     current_price: float
     ret_pct: float
-    reason: str  # 硬止损 / 跌破MA20 / 时间止损
+    reason: str  # 硬止损 / 跌破MA20 / 跌破MA_N / 时间止损
     detail: str
     price_basis: str = "hfq"  # "raw"（可下单）/ "hfq"（后复权降级表达）
 
@@ -189,7 +192,16 @@ class PositionManager:
     # ── 每日评估 ──
 
     def evaluate(self, as_of: str | None = None) -> list[ExitSignal]:
-        """按优先级评估全部持仓：硬止损 > 跌破MA20 > 时间止损。
+        """评估全部持仓，按优先级产出卖出提醒。
+
+        离场优先级：
+
+        - ``position_trail_ma > 0``（**默认**，移动止损模式）：
+          「硬止损 > 浮盈超 ``position_trail_activate`` 后收盘跌破 MA_N」。
+          该模式下**停用时间止损**——回测实测日线信号需持有 11 天以上才开始兑现，
+          固定 10 日时间止损会在临界点砍掉赢家（详见 README「回测实测结论」）。
+        - ``position_trail_ma = 0``（回退模式）：
+          「硬止损 > 收盘跌破 MA20 > 时间止损」。
 
         Args:
             as_of: 评估日（ISO 日期）。最后一根K线未到 as_of 的股票（停牌/
@@ -201,6 +213,9 @@ class PositionManager:
         signals: list[ExitSignal] = []
         stop_loss = self.settings.position_stop_loss
         time_days = self.settings.position_time_stop_days
+        # 移动止损配置（>0 启用 MA_N 移动止损并停用时间止损；0 = 沿用固定 MA20 + 时间止损）
+        trail_ma_cfg = max(0, int(self.settings.position_trail_ma or 0))
+        trail_activate = float(self.settings.position_trail_activate or 0.0)
 
         for pos in self.list_open():
             symbol = pos["symbol"]
@@ -256,9 +271,25 @@ class PositionManager:
                     reason = "硬止损"
                     detail = f"期间最低 {low_min:.2f} ≤ 止损价 {stop:.2f}，应已离场"
 
-                # 2. 趋势离场：收盘跌破 20 日均线
+                # 2. 移动止损 / 固定趋势离场
+                # 移动止损模式（position_trail_ma > 0）：浮盈超阈值后才启用 MA_N，
+                # 与回测引擎 --bt-trail-ma 同口径；此时停用时间止损，让赢家自己走。
+                # 固定模式：收盘跌破 MA20 离场。
                 # （detail 文案避免使用裸 "<" ">"，Telegram HTML 解析会报错）
-                if reason is None and len(df) >= 20:
+                trail_ma = trail_ma_cfg
+                if reason is None and trail_ma > 0:
+                    if len(df) >= trail_ma:
+                        ma_n = float(df["close"].rolling(trail_ma).mean().iloc[-1])
+                        if basis == "raw":
+                            ma_n *= scale
+                        armed = (ret_pct / 100.0) >= trail_activate
+                        if armed and current < ma_n:
+                            reason = f"跌破MA{trail_ma}"
+                            detail = (
+                                f"浮盈超 {trail_activate:.0%} 后收盘 {current:.2f} "
+                                f"低于 MA{trail_ma} {ma_n:.2f}，移动止损离场"
+                            )
+                elif reason is None and len(df) >= 20:
                     ma20 = float(df["close"].rolling(20).mean().iloc[-1])
                     if basis == "raw":
                         ma20 *= scale
@@ -267,7 +298,13 @@ class PositionManager:
                         detail = f"收盘 {current:.2f} 低于 MA20 {ma20:.2f}，趋势转弱"
 
                 # 3. 时间止损：持有 N 个交易日仍不盈利
-                if reason is None and held_bars - 1 >= time_days and current <= buy_price:
+                #    移动止损模式下不启用（回测结论：过早砍掉赢家，收益显著变差）
+                if (
+                    reason is None
+                    and trail_ma <= 0
+                    and held_bars - 1 >= time_days
+                    and current <= buy_price
+                ):
                     reason = "时间止损"
                     detail = f"已持有 {held_bars - 1} 个交易日仍无盈利，资金效率过低"
 

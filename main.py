@@ -36,18 +36,25 @@ from sequoia_x.strategy.base import BaseStrategy
 from sequoia_x.strategy.filters import filter_symbols
 from sequoia_x.strategy.high_tight_flag import HighTightFlagStrategy
 from sequoia_x.strategy.limit_up_shakeout import LimitUpShakeoutStrategy
-from sequoia_x.strategy.ma_volume import MaVolumeStrategy
-from sequoia_x.strategy.turtle_trade import TurtleTradeStrategy
 from sequoia_x.strategy.uptrend_limit_down import UptrendLimitDownStrategy
 from sequoia_x.strategy.rps_breakout import RpsBreakoutStrategy
 from sequoia_x.strategy.private_placement import PrivatePlacementStrategy
 
 
 def _build_strategies(engine: DataEngine, settings: Settings) -> list[BaseStrategy]:
-    """策略列表（新增策略在此追加即可）。"""
+    """策略列表（新增策略在此追加即可）。
+
+    已下线策略（代码保留在 strategy/ 目录便于回溯，可用 --bt-strategies 单独复测）：
+
+    - **MaVolumeStrategy**：回测（2025-09-18 ~ 2026-09-16）三组止损参数下全部亏损
+      （-183% ~ -196%，剔除最大单笔后约 -230%），胜率 16%~29%、盈利因子 < 0.65，
+      与止损参数无关，判定信号本身无 edge。
+    - **TurtleTradeStrategy**：移动止损参数敏感性测试（``trail_activate`` 0.0/0.03/0.05/0.10
+      四档）下 ``ex-top1`` 为 -112% / +76% / -39% / -99%，正负反复呈锯齿状；
+      0.03 的 +76% 是纯噪声（相邻两档均为负）。信号本身无稳定 edge，与止损参数无关，
+      ``total`` 依赖单笔妖股（剔除 +237% 后 -140%~-205%）。**不建议实盘**，故下线。
+    """
     return [
-        MaVolumeStrategy(engine=engine, settings=settings),
-        TurtleTradeStrategy(engine=engine, settings=settings),
         HighTightFlagStrategy(engine=engine, settings=settings),
         LimitUpShakeoutStrategy(engine=engine, settings=settings),
         UptrendLimitDownStrategy(engine=engine, settings=settings),
@@ -112,6 +119,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="仅回测指定策略：逗号分隔的策略标识，如 ma_volume,turtle（默认除定增外全部）",
     )
+    parser.add_argument("--bt-stop-loss", dest="bt_stop_loss", type=float, default=None,
+                        help="回测硬止损比例（默认取 POSITION_STOP_LOSS）")
+    parser.add_argument("--bt-time-stop", dest="bt_time_stop", type=int, default=None,
+                        help="回测时间止损天数（默认取 POSITION_TIME_STOP_DAYS）")
+    parser.add_argument("--bt-trail-ma", dest="bt_trail_ma", type=int, default=None,
+                        help="回测移动止损：收盘跌破 MA{N} 离场（如 10）。启用后不设时间止损")
+    parser.add_argument("--bt-trail-activate", dest="bt_trail_activate", type=float, default=0.0,
+                        help="移动止损启用所需最低浮盈（默认 0.0；如 0.05 = 浮盈超5%%才启用）")
 
     # ── 持仓管理 ──
     parser.add_argument("--position-add", dest="position_add", metavar="SYMBOL", default=None,
@@ -457,6 +472,10 @@ def _run_backtest(args: argparse.Namespace, engine: DataEngine, settings: Settin
         days=args.bt_days,
         step=args.bt_step,
         fee_rate=args.bt_fee,
+        stop_loss=args.bt_stop_loss,
+        time_stop_days=args.bt_time_stop,
+        trail_ma=args.bt_trail_ma,
+        trail_activate=args.bt_trail_activate,
     )
     reports = backtester.run()
 
@@ -486,6 +505,10 @@ def _run_backtest(args: argparse.Namespace, engine: DataEngine, settings: Settin
                 "signal_end": backtester.signal_dates[-1] if backtester.signal_dates else None,
                 "step": backtester.step,
                 "fee_rate": backtester.fee_rate,
+                "stop_loss": backtester.stop_loss,
+                "time_stop_days": backtester.time_days,
+                "trail_ma": backtester.trail_ma,
+                "trail_activate": backtester.trail_activate,
             },
             "benchmark_pct": round(backtester.benchmark_pct, 3),
             "reports": {name: rep.to_dict() for name, rep in reports.items()},

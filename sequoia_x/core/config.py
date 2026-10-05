@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     # ── 持仓/卖出提醒（见 sequoia_x/portfolio.py）──
     position_stop_loss: float = 0.07  # 硬止损：买入价 × (1 - 该比例)
     position_time_stop_days: int = 10  # 时间止损：持有 N 个交易日仍不盈利则提醒离场
+    # 移动止损：回测实测「MA10 + 浮盈5%启用」优于固定时间止损
+    #（RPS 剔除最大单笔后 +685% → +1070%，Turtle -140% → -39%）。
+    # position_trail_ma > 0 时，持仓提醒改用「浮盈超 position_trail_activate 后，
+    # 收盘跌破 MA_N 离场」，并停用时间止损；0 = 沿用固定 MA20 + 时间止损（回测引擎 --bt-trail-ma 同口径）。
+    position_trail_ma: int = 10
+    position_trail_activate: float = 0.05
 
     # ── 原始价同步（见 sequoia_x/data/engine.py）──
     enable_raw_prices: bool = True  # 日常增量/回填是否同步不复权收盘价（下单用）

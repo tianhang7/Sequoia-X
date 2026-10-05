@@ -14,13 +14,20 @@ AS_OF = "2026-09-25"
 DATES = weekdays_ending(AS_OF, 40)
 
 
-def _setup(tmp_path) -> tuple[DataEngine, Settings, PositionManager]:
-    settings = Settings(
+def _setup(tmp_path, **kw) -> tuple[DataEngine, Settings, PositionManager]:
+    defaults = dict(
         db_path=str(Path(tmp_path) / "test.db"),
         start_date="2026-06-01",
     )
+    defaults.update(kw)
+    settings = Settings(**defaults)
     engine = DataEngine(settings)
     return engine, settings, PositionManager(engine, settings)
+
+
+def _setup_legacy(tmp_path) -> tuple[DataEngine, Settings, PositionManager]:
+    """回退模式（POSITION_TRAIL_MA=0）：固定 MA20 + 时间止损。"""
+    return _setup(tmp_path, position_trail_ma=0)
 
 
 def _seed_scenarios(engine: DataEngine) -> None:
@@ -77,7 +84,8 @@ def test_add_rejects_duplicate_and_bad_params(tmp_path):
 
 
 def test_evaluate_priority_and_stale_skip(tmp_path):
-    engine, _, pm = _setup(tmp_path)
+    """回退模式（TRAIL_MA=0）：硬止损 > 跌破MA20 > 时间止损 + 数据滞后跳过。"""
+    engine, _, pm = _setup_legacy(tmp_path)
     _seed_scenarios(engine)
 
     for sym, price in [
